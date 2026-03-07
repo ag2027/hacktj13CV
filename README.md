@@ -8,12 +8,14 @@ This project uses a hybrid architecture:
 ## Files
 - `rover_hybrid.ino`: Arduino firmware
 - `rover_nav.py`: Python serial navigation controller (`DecisionEngine`)
-- `qml_decision_engine.py`: QML steering/action model for rover decisions
-- `qml_simulator_app.py`: Flask simulator for distance-to-action testing
-- `qml_route_planner.py`: Grid patrol routing (classical + genuine PennyLane QML)
-- `qml_grid_app.py`: Flask app for 2D pathfinding animation and benchmarks
-- `templates/index.html`: QML decision simulator UI
-- `templates/grid_qml.html`: 2D animated grid patrol UI
+- `QML/qml_decision_engine.py`: QML steering/action model for rover decisions
+- `QML/qml_simulator_app.py`: Flask simulator for distance-to-action testing
+- `QML/qml_route_planner.py`: Grid patrol routing (classical + PennyLane QML)
+- `QML/qml_grid_app.py`: Flask app for 2D pathfinding animation and benchmarks
+- `QML/patrol_to_arduino.py`: Executes planned QML route on Arduino motors over serial
+- `QML/sample_map.json`: Example arbitrary map input
+- `QML/templates/index.html`: QML decision simulator UI
+- `QML/templates/grid_qml.html`: 2D animated grid patrol UI
 - `requirements.txt`: Python dependencies
 
 ## Wiring Assumptions
@@ -72,44 +74,26 @@ python rover_nav.py --port COM3 --baud 9600
 ## QML Decision Simulator (Browser)
 Run:
 ```bash
-python3 qml_simulator_app.py
+python3 QML/qml_simulator_app.py
 ```
 Open:
 - `http://127.0.0.1:8000`
 
-## NEW: 2D QML Grid Pathfinding Animation
-This module animates a robot moving from `A` to `B` through checkpoint coverage in a grid world with obstacles.
-
-Included methods:
-- Classical nearest-neighbor baseline
-- Classical brute-force optimal baseline
-- PennyLane variational QML route planner (`AngleEmbedding` + `StronglyEntanglingLayers`)
-
+## 2D QML Grid Pathfinding Animation
 Run:
 ```bash
-python3 qml_grid_app.py
+python3 QML/qml_grid_app.py
 ```
 Open:
 - `http://127.0.0.1:8010`
 
-The UI shows:
-- animated robot path on grid
-- obstacle nodes and checkpoints
-- benchmark comparison (distance + runtime)
-- QML circuit diagram text output
+## Execute QML Route on Arduino
+Dry run:
+```bash
+python3 QML/patrol_to_arduino.py --map-json QML/sample_map.json --dry-run
+```
 
-## Output Schema (QML Route API)
-`GET /api/run` returns:
-- route checkpoint ordering
-- full grid path for animation
-- total distance and estimated time
-- improvement vs classical nearest-neighbor
-- quantum metadata (`n_qubits_used`, `quantum_circuit_depth`)
-- benchmark rows for classical and QML methods
-
-## Future Upgrades
-- Add multiple floor-plan presets and random scenario generation.
-- Add 2-opt and genetic classical baselines.
-- Replace variational scorer with QAOA/VQE encoding for richer combinatorial optimization.
-- Export benchmark plots to PNG automatically for pitch deck use.
-- Add ROS2 adapter for direct rover mission execution.
+Hardware run:
+```bash
+python3 QML/patrol_to_arduino.py --port /dev/ttyACM0 --map-json QML/sample_map.json --initial-heading E
+```
