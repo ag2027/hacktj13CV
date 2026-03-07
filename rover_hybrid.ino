@@ -7,7 +7,10 @@
 
   Protocol:
     - Outgoing sensor line: DIST:<value_cm>
-    - Incoming commands: FORWARD, LEFT, RIGHT, STOP
+    - Incoming commands:
+        FORWARD, LEFT, RIGHT, STOP
+        FORWARD:<ms>, LEFT:<ms>, RIGHT:<ms>
+        PING
 */
 
 // ----------------------------
@@ -27,17 +30,20 @@ const int IN4_PIN = 8;   // Right motor direction 2
 // ----------------------------
 // Control parameters
 // ----------------------------
-const int DRIVE_SPEED = 170;                // 0-255
-const unsigned long SENSOR_PERIOD_MS = 120; // Sensor publish rate
-const unsigned long CMD_TIMEOUT_MS = 1000;  // Safety timeout
+const int DRIVE_SPEED = 170;                 // 0-255
+const unsigned long SENSOR_PERIOD_MS = 120;  // Sensor publish rate
+const unsigned long CMD_TIMEOUT_MS = 1200;   // Safety timeout
+const unsigned long MAX_TIMED_MOVE_MS = 3000;
 
 // ----------------------------
 // Runtime state
 // ----------------------------
 unsigned long lastSensorTime = 0;
 unsigned long lastCommandTime = 0;
+unsigned long timedActionEndsAt = 0;
+bool timedActionActive = false;
 
-char cmdBuffer[20];
+char cmdBuffer[40];
 byte cmdIndex = 0;
 
 // ----------------------------
@@ -76,7 +82,6 @@ void turnRight() {
 }
 
 void stopMotors() {
-  // Disable both motors for a hard stop
   analogWrite(ENA_PIN, 0);
   analogWrite(ENB_PIN, 0);
 
@@ -101,20 +106,96 @@ long readDistanceCM() {
   return (long)(duration * 0.0343 / 2.0);
 }
 
-void processCommand(const char* command) {
-  if (strcmp(command, "FORWARD") == 0) {
-    moveForward();
-    lastCommandTime = millis();
-  } else if (strcmp(command, "LEFT") == 0) {
-    turnLeft();
-    lastCommandTime = millis();
-  } else if (strcmp(command, "RIGHT") == 0) {
-    turnRight();
-    lastCommandTime = millis();
-  } else if (strcmp(command, "STOP") == 0) {
-    stopMotors();
-    lastCommandTime = millis();
+void beginTimedAction(unsigned long durationMs) {
+  unsigned long clamped = durationMs;
+  if (clamped > MAX_TIMED_MOVE_MS) {
+    clamped = MAX_TIMED_MOVE_MS;
   }
+  timedActionEndsAt = millis() + clamped;
+  timedActionActive = true;
+}
+
+void clearTimedAction() {
+  timedActionActive = false;
+  timedActionEndsAt = 0;
+}
+
+bool parseTimedCommand(const char* command, char* actionOut, unsigned long* durationOut) {
+  const char* colon = strchr(command, ':');
+  if (colon == NULL) {
+    return false;
+  }
+
+  int actionLen = (int)(colon - command);
+  if (actionLen <= 0 || actionLen > 10) {
+    return false;
+  }
+
+  strncpy(actionOut, command, actionLen);
+  actionOut[actionLen] = '\0';
+
+  long parsed = atol(colon + 1);
+  if (parsed <= 0) {
+    return false;
+  }
+
+  *durationOut = (unsigned long)parsed;
+  return true;
+}
+
+void executeActionName(const char* action) {
+  if (strcmp(action, "FORWARD") == 0) {
+    moveForward();
+  } else if (strcmp(action, "LEFT") == 0) {
+    turnLeft();
+  } else if (strcmp(action, "RIGHT") == 0) {
+    turnRight();
+  } else {
+    stopMotors();
+  }
+}
+
+void processCommand(const char* command) {
+  lastCommandTime = millis();
+
+  if (strcmp(command, "PING") == 0) {
+    Serial.println("PONG");
+    return;
+  }
+
+  if (strcmp(command, "STOP") == 0) {
+    stopMotors();
+    clearTimedAction();
+    Serial.println("ACK:STOP");
+    return;
+  }
+
+  // Timed commands: FORWARD:450 / LEFT:330 / RIGHT:330
+  char actionName[12];
+  unsigned long durationMs = 0;
+  if (parseTimedCommand(command, actionName, &durationMs)) {
+    if (strcmp(actionName, "FORWARD") == 0 || strcmp(actionName, "LEFT") == 0 || strcmp(actionName, "RIGHT") == 0) {
+      executeActionName(actionName);
+      beginTimedAction(durationMs);
+      Serial.print("ACK:");
+      Serial.print(actionName);
+      Serial.print(":");
+      Serial.println(durationMs);
+      return;
+    }
+  }
+
+  // Non-timed continuous commands
+  if (strcmp(command, "FORWARD") == 0 || strcmp(command, "LEFT") == 0 || strcmp(command, "RIGHT") == 0) {
+    executeActionName(command);
+    clearTimedAction();
+    Serial.print("ACK:");
+    Serial.println(command);
+    return;
+  }
+
+  Serial.print("ERR:UNKNOWN:");
+  Serial.println(command);
 }
 
 // Non-blocking serial line reader.
@@ -131,8 +212,7 @@ void pollSerial() {
     } else if (cmdIndex < sizeof(cmdBuffer) - 1) {
       cmdBuffer[cmdIndex++] = c;
     } else {
-      // Buffer overflow guard: reset and wait for a fresh line.
-      cmdIndex = 0;
+      cmdIndex = 0; // overflow guard
     }
   }
 }
@@ -151,6 +231,7 @@ void setup() {
   Serial.begin(9600);
   stopMotors();
   lastCommandTime = millis();
+  Serial.println("READY");
 }
 
 void loop() {
@@ -158,8 +239,15 @@ void loop() {
 
   unsigned long now = millis();
 
+  // Stop after timed action duration elapses.
+  if (timedActionActive && now >= timedActionEndsAt) {
+    stopMotors();
+    clearTimedAction();
+    Serial.println("DONE");
+  }
+
   // Safety: stop rover if Python command stream is lost.
-  if (now - lastCommandTime > CMD_TIMEOUT_MS) {
+  if ((now - lastCommandTime > CMD_TIMEOUT_MS) && !timedActionActive) {
     stopMotors();
   }
 

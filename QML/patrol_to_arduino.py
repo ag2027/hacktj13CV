@@ -2,7 +2,8 @@
 Execute QML patrol plans on Arduino motor controller via serial commands.
 
 Uses the route planner output (full grid path), converts it into turn/forward
-motor actions, and streams commands: FORWARD, LEFT, RIGHT, STOP.
+motor actions, and streams timed commands directly handled by Arduino firmware:
+  FORWARD:<ms>, LEFT:<ms>, RIGHT:<ms>, STOP
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ def turn_sequence(current: str, target: str):
         return ["RIGHT"]
     if LEFT_TURN[current] == target:
         return ["LEFT"]
-    # 180 turn: two right turns
     return ["RIGHT", "RIGHT"]
 
 
@@ -56,13 +56,11 @@ def path_to_motion(path: list[list[int]] | list[tuple[int, int]], initial_headin
         x2, y2 = path[i + 1]
         step = (x2 - x1, y2 - y1)
         if step not in VEC_TO_HEADING:
-            raise ValueError(f"Non-grid step detected: {path[i]} -> {path[i+1]}")
+            raise ValueError(f"Non-grid step detected: {path[i]} -> {path[i + 1]}")
 
         target_heading = VEC_TO_HEADING[step]
-        turns = turn_sequence(heading, target_heading)
-        cmds.extend(turns)
+        cmds.extend(turn_sequence(heading, target_heading))
         heading = target_heading
-
         cmds.append("FORWARD")
 
     return cmds
@@ -73,6 +71,15 @@ def send_command(ser: serial.Serial, command: str):
     ser.flush()
 
 
+def read_serial_nonblocking(ser: serial.Serial):
+    lines = []
+    while ser.in_waiting:
+        raw = ser.readline().decode("utf-8", errors="ignore").strip()
+        if raw:
+            lines.append(raw)
+    return lines
+
+
 def execute_motion(
     port: str,
     baud: int,
@@ -81,18 +88,32 @@ def execute_motion(
     turn_s: float,
     settle_s: float,
 ):
-    with serial.Serial(port, baudrate=baud, timeout=0.2) as ser:
+    with serial.Serial(port, baudrate=baud, timeout=0.15) as ser:
         time.sleep(2.0)
+        read_serial_nonblocking(ser)
+        send_command(ser, "PING")
+        time.sleep(0.15)
+        for line in read_serial_nonblocking(ser):
+            print(f"[SERIAL] {line}")
+
         send_command(ser, "STOP")
-        time.sleep(0.2)
+        time.sleep(0.1)
 
         print(f"[INFO] Executing {len(commands)} motion commands on {port}")
         for idx, cmd in enumerate(commands, start=1):
-            print(f"[STEP {idx:03d}] {cmd}")
-            send_command(ser, cmd)
-            time.sleep(turn_s if cmd in ("LEFT", "RIGHT") else forward_s)
-            send_command(ser, "STOP")
-            time.sleep(settle_s)
+            dur_ms = int((turn_s if cmd in ("LEFT", "RIGHT") else forward_s) * 1000)
+            timed = f"{cmd}:{dur_ms}"
+            print(f"[STEP {idx:03d}] {timed}")
+            send_command(ser, timed)
+
+            # Arduino executes timed action; host waits until it should be complete.
+            wait_s = (dur_ms / 1000.0) + settle_s
+            t_end = time.time() + wait_s
+            while time.time() < t_end:
+                for line in read_serial_nonblocking(ser):
+                    if line.startswith("ACK:") or line == "DONE":
+                        print(f"[SERIAL] {line}")
+                time.sleep(0.02)
 
         send_command(ser, "STOP")
         print("[INFO] Execution complete. Rover stopped.")
@@ -111,7 +132,7 @@ def main():
     parser.add_argument("--forward-s", type=float, default=0.45)
     parser.add_argument("--turn-s", type=float, default=0.33)
     parser.add_argument("--settle-s", type=float, default=0.08)
-    parser.add_argument("--dry-run", action="store_true", help="Print commands without sending serial")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without serial")
     args = parser.parse_args()
 
     map_spec = load_map_spec(args.map_json)

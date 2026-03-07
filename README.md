@@ -44,6 +44,7 @@ This project uses a hybrid architecture:
 ## Serial Protocol
 - Arduino -> Python: `DIST:<value>`
 - Python -> Arduino: `FORWARD`, `LEFT`, `RIGHT`, `STOP`
+- Timed motion protocol (recommended): `FORWARD:<ms>`, `LEFT:<ms>`, `RIGHT:<ms>`
 
 ## Library Requirements
 - Arduino IDE (standard core)
@@ -70,6 +71,11 @@ Windows example:
 ```bash
 python rover_nav.py --port COM3 --baud 9600
 ```
+
+## Arduino-Direct Motion Notes
+- Upload `rover_hybrid.ino` first; this firmware now supports timed motor commands directly.
+- `QML/patrol_to_arduino.py` sends timed commands so execution timing runs on Arduino.
+- Firmware responses include `READY`, `ACK:<command>`, `DONE`, and `ERR:UNKNOWN:<cmd>`.
 
 ## QML Decision Simulator (Browser)
 Run:
