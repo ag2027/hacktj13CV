@@ -43,8 +43,9 @@ This project uses a hybrid architecture:
 
 ## Serial Protocol
 - Arduino -> Python: `DIST:<value>`
-- Python -> Arduino: `FORWARD`, `LEFT`, `RIGHT`, `STOP`
-- Timed motion protocol (recommended): `FORWARD:<ms>`, `LEFT:<ms>`, `RIGHT:<ms>`
+- Python/Host -> Arduino: `FORWARD`, `LEFT`, `RIGHT`, `STOP`
+- Timed protocol: `FORWARD:<ms>`, `LEFT:<ms>`, `RIGHT:<ms>`
+- Mode control: `MODE:AUTO`, `MODE:MANUAL`
 
 ## Library Requirements
 - Arduino IDE (standard core)
@@ -55,6 +56,20 @@ Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
+
+## Setup Instructions (Arduino Standalone, No Python Required)
+1. Open `rover_hybrid.ino` in Arduino IDE.
+2. Select board: **Arduino Uno** and correct serial port.
+3. Upload firmware.
+4. Place rover on a stand, then power the rover.
+5. Rover starts in `AUTO` mode by default and drives using onboard ultrasonic logic.
+
+Optional serial mode commands from Serial Monitor or host:
+- `MODE:AUTO`
+- `MODE:MANUAL`
+- `FORWARD`, `LEFT`, `RIGHT`, `STOP`
+- `FORWARD:<ms>`, `LEFT:<ms>`, `RIGHT:<ms>`
+- `SET:STOP:<cm>`, `SET:TURN:<cm>`
 
 ## Setup Instructions (Hardware + Classical Controller)
 1. Open `rover_hybrid.ino` in Arduino IDE.
