@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QML Grid Patrol Demo</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --line: #d7dfeb;
+      --ink: #12263a;
+    }
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 90% 15%, #d8f3ff, transparent 30%),
+        radial-gradient(circle at 10% 90%, #ffe9d5, transparent 28%),
+        var(--bg);
+    }
+    .wrap {
+      max-width: 1150px;
+      margin: 20px auto;
+      padding: 0 14px;
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+      padding: 12px;
+    }
+    h1 { margin: 0 0 8px; font-size: 1.1rem; }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .controls label { font-size: 12px; }
+    .controls input, .controls select, .controls button {
+      width: 100%;
+      padding: 6px;
+      border-radius: 8px;
+      border: 1px solid #cbd5e1;
+      box-sizing: border-box;
+      font-size: 13px;
+    }
+    .controls button {
+      background: linear-gradient(90deg, #0ea5a6, #22c55e);
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    #canvas {
+      width: 100%;
+      aspect-ratio: 14/10;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #f8fafc;
+    }
+    pre {
+      white-space: pre-wrap;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      font-size: 12px;
+      max-height: 220px;
+      overflow: auto;
+    }
+    .stat { font-size: 14px; margin: 6px 0; }
+    .bar { height: 12px; background: #e9eef6; border-radius: 8px; overflow: hidden; margin: 4px 0 10px; }
+    .bar > div { height: 100%; background: linear-gradient(90deg, #06b6d4, #3b82f6); }
+    @media (max-width: 900px) {
+      .wrap { grid-template-columns: 1fr; }
+      .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="card">
+      <h1>2D Grid Pathfinding Animation (QML + Classical Baselines)</h1>
+      <div class="controls">
+        <label>Random Scenario
+          <select id="randomMode">
+            <option value="1" selected>On</option>
+            <option value="0">Off (Default map)</option>
+          </select>
+        </label>
+        <label>Seed
+          <input id="seed" type="number" value="4" min="0" step="1" />
+        </label>
+        <label>Checkpoints
+          <input id="checkpoints" type="number" value="4" min="2" max="6" step="1" />
+        </label>
+        <label>Obstacle Density
+          <input id="density" type="number" value="0.18" min="0.05" max="0.35" step="0.01" />
+        </label>
+        <label>Actions
+          <button id="runBtn">Generate + Animate</button>
+        </label>
+      </div>
+      <canvas id="canvas" width="840" height="600"></canvas>
+    </section>
+
+    <aside class="card">
+      <h1>Scenario + Benchmark</h1>
+      <div id="stats"></div>
+      <div id="bars"></div>
+      <h1>Circuit</h1>
+      <pre id="circuit">Loading...</pre>
+    </aside>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const stats = document.getElementById("stats");
+    const bars = document.getElementById("bars");
+    const circuitPre = document.getElementById("circuit");
+
+    const runBtn = document.getElementById("runBtn");
+    const randomMode = document.getElementById("randomMode");
+    const seedInput = document.getElementById("seed");
+    const checkpointsInput = document.getElementById("checkpoints");
+    const densityInput = document.getElementById("density");
+
+    let model = null;
+    let animPath = [];
+    let animIdx = 0;
+    let tPrev = 0;
+
+    function toPx(x, y, w, h, gw, gh) {
+      const cellW = w / gw;
+      const cellH = h / gh;
+      return [x * cellW + cellW / 2, y * cellH + cellH / 2, cellW, cellH];
+    }
+
+    function drawGrid() {
+      if (!model) return;
+      const { width, height, obstacles, checkpoints } = model.grid;
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const cellW = w / width;
+      const cellH = h / height;
+
+      ctx.fillStyle = "#f8fafc";
+      ctx.fillRect(0, 0, w, h);
+
+      ctx.strokeStyle = "#d7dfeb";
+      for (let x = 0; x <= width; x++) {
+        ctx.beginPath();
+        ctx.moveTo(x * cellW, 0);
+        ctx.lineTo(x * cellW, h);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= height; y++) {
+        ctx.beginPath();
+        ctx.moveTo(0, y * cellH);
+        ctx.lineTo(w, y * cellH);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = "#1f2937";
+      for (const [ox, oy] of obstacles) {
+        ctx.fillRect(ox * cellW, oy * cellH, cellW, cellH);
+      }
+
+      ctx.fillStyle = "#0ea5a6";
+      ctx.font = "bold 14px Avenir Next";
+      for (const cp of checkpoints) {
+        const [px, py] = toPx(cp.x, cp.y, w, h, width, height);
+        ctx.beginPath();
+        ctx.arc(px, py, Math.min(cellW, cellH) * 0.28, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#0b3c4a";
+        ctx.fillText(cp.id, px - 10, py - 10);
+        ctx.fillStyle = "#0ea5a6";
+      }
+
+      if (animPath.length > 1) {
+        ctx.strokeStyle = "#f97316";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        for (let i = 0; i <= animIdx && i < animPath.length; i++) {
+          const [x, y] = animPath[i];
+          const [px, py] = toPx(x, y, w, h, width, height);
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      }
+
+      if (animPath.length) {
+        const [rx, ry] = animPath[Math.min(animIdx, animPath.length - 1)];
+        const [rpx, rpy, cW, cH] = toPx(rx, ry, w, h, width, height);
+        ctx.fillStyle = "#ef4444";
+        ctx.beginPath();
+        ctx.arc(rpx, rpy, Math.min(cW, cH) * 0.23, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function animate(ts) {
+      if (!tPrev) tPrev = ts;
+      const dt = ts - tPrev;
+      if (dt > 70 && animIdx < animPath.length - 1) {
+        animIdx += 1;
+        tPrev = ts;
+      }
+      drawGrid();
+      if (animIdx < animPath.length - 1) requestAnimationFrame(animate);
+    }
+
+    function renderBenchmarks(data) {
+      const q = data.benchmarks.find(b => b.method === "qml_variational");
+      const nn = data.benchmarks.find(b => b.method === "nearest_neighbor");
+      const bf = data.benchmarks.find(b => b.method === "brute_force");
+
+      const s = data.scenario;
+      stats.innerHTML = `
+        <div class="stat"><b>Randomized:</b> ${s.randomized}</div>
+        <div class="stat"><b>Seed:</b> ${s.seed}</div>
+        <div class="stat"><b>Obstacles:</b> ${s.obstacle_count}</div>
+        <div class="stat"><b>Checkpoints:</b> ${s.checkpoint_count}</div>
+        <div class="stat"><b>Total distance:</b> ${data.total_distance_m}</div>
+        <div class="stat"><b>Improvement vs NN:</b> ${data.optimization_improvement_vs_classical}</div>
+      `;
+
+      const maxD = Math.max(...data.benchmarks.map(b => b.distance));
+      const items = [nn, bf, q].map(b => {
+        const pct = maxD === 0 ? 0 : (b.distance / maxD) * 100;
+        return `
+          <div class="stat"><b>${b.method}</b>: dist=${b.distance}, time=${b.time_ms} ms</div>
+          <div class="bar"><div style="width:${pct}%"></div></div>
+        `;
+      }).join("");
+
+      bars.innerHTML = items;
+      circuitPre.textContent = data.circuit_diagram;
+    }
+
+    function makeQuery() {
+      const random = randomMode.value;
+      const seed = seedInput.value || 4;
+      const checkpoints = checkpointsInput.value || 4;
+      const density = densityInput.value || 0.18;
+      return `random=${encodeURIComponent(random)}&seed=${encodeURIComponent(seed)}&checkpoints=${encodeURIComponent(checkpoints)}&density=${encodeURIComponent(density)}`;
+    }
+
+    async function run() {
+      runBtn.disabled = true;
+      runBtn.textContent = "Generating...";
+      const res = await fetch(`/api/run?${makeQuery()}`);
+      model = await res.json();
+      animPath = model.full_path;
+      animIdx = 0;
+      tPrev = 0;
+      renderBenchmarks(model);
+      drawGrid();
+      requestAnimationFrame(animate);
+      runBtn.disabled = false;
+      runBtn.textContent = "Generate + Animate";
+    }
+
+    runBtn.addEventListener("click", run);
+    window.addEventListener("load", run);
+  </script>
+</body>
+</html>

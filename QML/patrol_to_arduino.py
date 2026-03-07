@@ -1,0 +1,220 @@
+"""
+Execute QML patrol plans on Arduino motor controller via serial commands.
+
+Uses the route planner output (full grid path), converts it into turn/forward
+motor actions, and streams timed commands directly handled by Arduino firmware:
+  FORWARD:<ms>, LEFT:<ms>, RIGHT:<ms>, STOP
+
+Default mode now pushes the full grid path to Arduino (`PATH:` payload) so
+path-to-motion conversion executes on the board. Legacy host-timed mode is
+still available with --host-motion.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import serial
+
+from qml_route_planner import run_benchmark
+
+HEADING_TO_VEC = {
+    "N": (0, -1),
+    "E": (1, 0),
+    "S": (0, 1),
+    "W": (-1, 0),
+}
+VEC_TO_HEADING = {v: k for k, v in HEADING_TO_VEC.items()}
+RIGHT_TURN = {"N": "E", "E": "S", "S": "W", "W": "N"}
+LEFT_TURN = {"N": "W", "W": "S", "S": "E", "E": "N"}
+
+
+def load_map_spec(path: str | None):
+    if not path:
+        return None
+    return json.loads(Path(path).read_text())
+
+
+def turn_sequence(current: str, target: str):
+    if current == target:
+        return []
+    if RIGHT_TURN[current] == target:
+        return ["RIGHT"]
+    if LEFT_TURN[current] == target:
+        return ["LEFT"]
+    return ["RIGHT", "RIGHT"]
+
+
+def path_to_motion(path: list[list[int]] | list[tuple[int, int]], initial_heading: str):
+    if len(path) < 2:
+        return []
+
+    cmds: list[str] = []
+    heading = initial_heading
+
+    for i in range(len(path) - 1):
+        x1, y1 = path[i]
+        x2, y2 = path[i + 1]
+        step = (x2 - x1, y2 - y1)
+        if step not in VEC_TO_HEADING:
+            raise ValueError(f"Non-grid step detected: {path[i]} -> {path[i + 1]}")
+
+        target_heading = VEC_TO_HEADING[step]
+        cmds.extend(turn_sequence(heading, target_heading))
+        heading = target_heading
+        cmds.append("FORWARD")
+
+    return cmds
+
+
+def path_to_arduino_spec(path: list[list[int]] | list[tuple[int, int]]) -> str:
+    if not path:
+        raise ValueError("Path is empty")
+    return "PATH:" + "|".join(f"{int(x)},{int(y)}" for x, y in path)
+
+
+def send_command(ser: serial.Serial, command: str):
+    ser.write((command + "\n").encode("utf-8"))
+    ser.flush()
+
+
+def read_serial_nonblocking(ser: serial.Serial):
+    lines = []
+    while ser.in_waiting:
+        raw = ser.readline().decode("utf-8", errors="ignore").strip()
+        if raw:
+            lines.append(raw)
+    return lines
+
+
+def execute_motion(
+    port: str,
+    baud: int,
+    commands: list[str],
+    path_spec: str | None,
+    use_arduino_path_mode: bool,
+    forward_s: float,
+    turn_s: float,
+    settle_s: float,
+):
+    with serial.Serial(port, baudrate=baud, timeout=0.15) as ser:
+        time.sleep(2.0)
+        read_serial_nonblocking(ser)
+        send_command(ser, "PING")
+        time.sleep(0.15)
+        for line in read_serial_nonblocking(ser):
+            print(f"[SERIAL] {line}")
+
+        send_command(ser, "STOP")
+        time.sleep(0.1)
+
+        if use_arduino_path_mode:
+            if not path_spec:
+                raise ValueError("path_spec is required when use_arduino_path_mode=True")
+
+            print(f"[INFO] Sending Arduino path execution payload on {port}")
+            send_command(ser, path_spec)
+
+            idle_cycles = 0
+            while idle_cycles < 80:
+                lines = read_serial_nonblocking(ser)
+                if lines:
+                    idle_cycles = 0
+                else:
+                    idle_cycles += 1
+
+                for line in lines:
+                    if line.startswith("ACK:") or line.startswith("ERR:") or line == "DONE":
+                        print(f"[SERIAL] {line}")
+
+                time.sleep(0.05)
+        else:
+            print(f"[INFO] Executing {len(commands)} motion commands on {port}")
+            for idx, cmd in enumerate(commands, start=1):
+                dur_ms = int((turn_s if cmd in ("LEFT", "RIGHT") else forward_s) * 1000)
+                timed = f"{cmd}:{dur_ms}"
+                print(f"[STEP {idx:03d}] {timed}")
+                send_command(ser, timed)
+
+                # Arduino executes timed action; host waits until it should be complete.
+                wait_s = (dur_ms / 1000.0) + settle_s
+                t_end = time.time() + wait_s
+                while time.time() < t_end:
+                    for line in read_serial_nonblocking(ser):
+                        if line.startswith("ACK:") or line == "DONE":
+                            print(f"[SERIAL] {line}")
+                    time.sleep(0.02)
+
+        send_command(ser, "STOP")
+        print("[INFO] Execution complete. Rover stopped.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run QML patrol route on Arduino rover")
+    parser.add_argument("--port", help="Serial port (e.g. /dev/ttyACM0 or COM3)")
+    parser.add_argument("--baud", type=int, default=9600)
+    parser.add_argument("--seed", type=int, default=4)
+    parser.add_argument("--random", action="store_true", help="Use randomized map generation")
+    parser.add_argument("--checkpoints", type=int, default=4)
+    parser.add_argument("--density", type=float, default=0.18)
+    parser.add_argument("--map-json", help="Path to custom map JSON for arbitrary environment")
+    parser.add_argument("--initial-heading", choices=["N", "E", "S", "W"], default="E")
+    parser.add_argument("--forward-s", type=float, default=0.45)
+    parser.add_argument("--turn-s", type=float, default=0.33)
+    parser.add_argument("--settle-s", type=float, default=0.08)
+    parser.add_argument(
+        "--host-motion",
+        action="store_true",
+        help="Keep path->motion conversion on host (legacy). Default uses Arduino PATH execution.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without serial")
+    args = parser.parse_args()
+
+    map_spec = load_map_spec(args.map_json)
+
+    result = run_benchmark(
+        seed=args.seed,
+        randomize=args.random and map_spec is None,
+        n_checkpoints=args.checkpoints,
+        obstacle_density=args.density,
+        map_spec=map_spec,
+    )
+
+    full_path = result["full_path"]
+    commands = path_to_motion(full_path, initial_heading=args.initial_heading)
+    path_spec = path_to_arduino_spec(full_path)
+    use_arduino_path_mode = not args.host_motion
+
+    print("[INFO] Scenario:", result["scenario"])
+    print("[INFO] Route:", [r["checkpoint_id"] for r in result["route"]])
+    print("[INFO] Grid path length:", len(full_path))
+    print("[INFO] Motor command count:", len(commands))
+    print("[INFO] Motion executor:", "arduino_path_mode" if use_arduino_path_mode else "host_timed_mode")
+
+    if args.dry_run:
+        if use_arduino_path_mode:
+            print("[DRY RUN] Path payload:", path_spec)
+        else:
+            print("[DRY RUN] Commands:", commands)
+        return
+
+    if not args.port:
+        raise ValueError("--port is required unless --dry-run is used")
+
+    execute_motion(
+        port=args.port,
+        baud=args.baud,
+        commands=commands,
+        path_spec=path_spec,
+        use_arduino_path_mode=use_arduino_path_mode,
+        forward_s=args.forward_s,
+        turn_s=args.turn_s,
+        settle_s=args.settle_s,
+    )
+
+
+if __name__ == "__main__":
+    main()
