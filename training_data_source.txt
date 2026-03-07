@@ -1,0 +1,16 @@
+Source dataset URL:
+https://data.thailand.opendevelopmentmekong.net/en/datastore/dump/26fddd90-5f4c-412c-93c3-6c6566554fda
+
+Dataset title (from OD Mekong portal):
+Baseline Survey Result in Cambodia by villages (mine/ERW risk attributes)
+
+Transformation used to produce training_data.csv (500 rows):
+- Kept rows with categorical fields fear_level in {Low, Medium, High}
+  and proximity in {Very Near, Near, Far, Very Far}
+- Positive class (label=1, unsafe): fear_level in {Medium, High} OR proximity in {Very Near, Near}
+- Negative class (label=0, safer/no-mine proxy): fear_level == Low
+- Sampled 250 positive + 250 negative rows
+- Mapped to rover features:
+  distance_cm from proximity bucket + small noise
+  turn_hint from fear_level bucket + small noise
+- Exported columns: distance_cm,turn_hint,label
