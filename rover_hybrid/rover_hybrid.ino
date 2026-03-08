@@ -1,85 +1,94 @@
+#include <Servo.h>
+
 /*
-  Arduino Rover Controller (Hybrid: Sensor Auto + Path Execution)
-  ---------------------------------------------------------------
-  Board: Arduino Uno
-  Sensor: HC-SR04 ultrasonic sensor
-  Driver: L298N motor driver
+  Rover Hybrid Controller (Sample-Hardware Pinout)
+  ------------------------------------------------
+  Ultrasonic: Echo=A4, Trig=A5
+  Servo: D3
+  Line sensors: Right=D10, Mid=D4, Left=D2 (active-low)
+  Motor: ENA=5 ENB=6 IN1=7 IN2=8 IN3=9 IN4=11
 
-  Purpose:
-  - Mirror the Python/QML control flow directly on Arduino:
-    1) Distance-gated autonomous policy (STOP / TURN / FORWARD)
-    2) Timed motor action executor (FORWARD:<ms>, LEFT:<ms>, RIGHT:<ms>)
-    3) Grid path -> turn/forward conversion (like patrol_to_arduino.py)
-
-  Serial protocol:
-    Outgoing:
-      READY
-      DIST:<cm>
-      MODE:AUTO or MODE:MANUAL
-      ACK:<...>
-      DONE
-      ERR:<reason>
-
-    Incoming:
-      MODE:AUTO
-      MODE:MANUAL
-      STOP
-      FORWARD, LEFT, RIGHT
-      FORWARD:<ms>, LEFT:<ms>, RIGHT:<ms>
-      PATH:x1,y1|x2,y2|x3,y3|...
-      QTURN:<hint_0_to_100>
-      SET:STOP:<cm>
-      SET:TURN:<cm>
-      SET:FORWARD_MS:<ms>
-      SET:TURN_MS:<ms>
-      SET:HEADING:N|E|S|W
-      PING
+  Incoming serial commands:
+    MODE:AUTO | MODE:MANUAL
+    STOP | FORWARD | LEFT | RIGHT | BACK
+    FORWARD:<ms> | LEFT:<ms> | RIGHT:<ms> | BACK:<ms>
+    SET:STOP:<cm> | SET:TURN:<cm>
+    SET:FORWARD_MS:<ms> | SET:TURN_MS:<ms>
+    SET:HEADING:N|E|S|W
+    SET:BOUNDS:minX,maxX,minY,maxY
+    SET:POS:x,y
+    SET:LINE:0|1
+    GET:STATE
+    PING
 */
 
-#include <math.h>
-#include <stdlib.h>
-#include <string.h>
+// ----------------------------
+// 1) Hardware pins
+// ----------------------------
+const int PIN_ECHO = A4;
+const int PIN_TRIG = A5;
+const int PIN_SERVO = 3;
+
+const int PIN_LT_R = 10;
+const int PIN_LT_M = 4;
+const int PIN_LT_L = 2;
+
+const int ENA = 5;
+const int ENB = 6;
+const int IN1 = 7;
+const int IN2 = 8;
+const int IN3 = 9;
+const int IN4 = 11;
+
+Servo scanServo;
 
 // ----------------------------
-// 1) Pin assignments
+// 2) Control config
 // ----------------------------
-const int TRIG_PIN = 9;
-const int ECHO_PIN = 10;
-
-const int ENA_PIN = 5;
-const int IN1_PIN = 2;
-const int IN2_PIN = 3;
-
-const int ENB_PIN = 6;
-const int IN3_PIN = 7;
-const int IN4_PIN = 8;
-
-// ----------------------------
-// 2) Timing + policy parameters
-// ----------------------------
-const int DRIVE_SPEED = 170;
+const int MOTOR_SPEED = 220;
+const int FORWARD_LEFT_TRIM = 20;  // Left side slower by this amount to correct drift.
 const unsigned long SENSOR_PERIOD_MS = 120;
-const unsigned long DECISION_PERIOD_MS = 130;
-const unsigned long CMD_TIMEOUT_MS = 1200;
+const unsigned long DECISION_PERIOD_MS = 120;
+const unsigned long CMD_TIMEOUT_MS = 1500;
 const unsigned long MAX_TIMED_MOVE_MS = 3000;
+
+const bool USE_LINE_SENSORS_DEFAULT = false;
+const byte EDGE_HIT_CONFIRM_COUNT = 3;
+const byte OBSTACLE_HIT_CONFIRM_COUNT = 2;
 
 long STOP_DISTANCE_CM = 12;
 long TURN_DISTANCE_CM = 30;
 
-unsigned long FORWARD_STEP_MS = 450;
-unsigned long TURN_STEP_MS = 330;
-unsigned long AUTO_ESCAPE_TURN_MS = 280;
-unsigned long AUTO_CAUTION_TURN_MS = 140;
+unsigned long FORWARD_STEP_MS = 420;
+unsigned long TURN_STEP_MS = 432;
+unsigned long ESCAPE_TURN_MS = 432;
 
 // ----------------------------
-// 3) Runtime state
+// 3) State
 // ----------------------------
 enum ControlMode { MODE_AUTO, MODE_MANUAL };
-enum MotionAction { ACTION_STOP, ACTION_FORWARD, ACTION_LEFT, ACTION_RIGHT };
+enum MotionAction { ACTION_STOP, ACTION_FORWARD, ACTION_BACK, ACTION_LEFT, ACTION_RIGHT };
 enum Heading { HEADING_N, HEADING_E, HEADING_S, HEADING_W };
 
 ControlMode mode = MODE_AUTO;
-Heading roverHeading = HEADING_E;
+Heading heading = HEADING_E;
+
+long gridX = 0;
+long gridY = 0;
+long boundMinX = 0;
+long boundMaxX = 5;
+long boundMinY = 0;
+long boundMaxY = 1;
+
+bool turnLeftNext = true;
+bool useLineSensors = USE_LINE_SENSORS_DEFAULT;
+byte edgeHitStreak = 0;
+byte obstacleHitStreak = 0;
+bool snakeModeEnabled = true;
+bool snakeMovingEast = true;
+int snakeRowStep = 1;
+bool snakeFlipAfterForward = false;
+bool snakeFinished = false;
 
 unsigned long lastSensorTime = 0;
 unsigned long lastDecisionTime = 0;
@@ -90,150 +99,94 @@ bool timedActionActive = false;
 MotionAction activeAction = ACTION_STOP;
 
 long latestDistanceCm = 400;
-bool turnLeftNext = true;
 
-char cmdBuffer[240];
+char cmdBuffer[180];
 byte cmdIndex = 0;
 
 // ----------------------------
-// 4) Timed action queue
+// 4) Motion helpers
 // ----------------------------
-struct TimedAction {
-  MotionAction action;
-  unsigned long durationMs;
-};
-
-const byte ACTION_QUEUE_SIZE = 40;
-TimedAction actionQueue[ACTION_QUEUE_SIZE];
-byte actionQueueHead = 0;
-byte actionQueueTail = 0;
-
-bool queueIsEmpty() {
-  return actionQueueHead == actionQueueTail;
+void forward(uint8_t speedVal) {
+  int leftSpeed = speedVal - FORWARD_LEFT_TRIM;
+  if (leftSpeed < 0) leftSpeed = 0;
+  analogWrite(ENA, leftSpeed);
+  analogWrite(ENB, speedVal);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
 }
 
-bool queueIsFull() {
-  return (byte)(actionQueueTail + 1) % ACTION_QUEUE_SIZE == actionQueueHead;
+void back(uint8_t speedVal) {
+  analogWrite(ENA, speedVal);
+  analogWrite(ENB, speedVal);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
 }
 
-bool enqueueAction(MotionAction action, unsigned long durationMs) {
-  if (queueIsFull()) return false;
-  if (durationMs > MAX_TIMED_MOVE_MS) durationMs = MAX_TIMED_MOVE_MS;
-  actionQueue[actionQueueTail].action = action;
-  actionQueue[actionQueueTail].durationMs = durationMs;
-  actionQueueTail = (byte)(actionQueueTail + 1) % ACTION_QUEUE_SIZE;
-  return true;
+void left(uint8_t speedVal) {
+  analogWrite(ENA, speedVal);
+  analogWrite(ENB, speedVal);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
 }
 
-bool dequeueAction(TimedAction* out) {
-  if (queueIsEmpty()) return false;
-  *out = actionQueue[actionQueueHead];
-  actionQueueHead = (byte)(actionQueueHead + 1) % ACTION_QUEUE_SIZE;
-  return true;
-}
-
-void clearQueue() {
-  actionQueueHead = 0;
-  actionQueueTail = 0;
-}
-
-// ----------------------------
-// 5) Motor primitives
-// ----------------------------
-void moveForward() {
-  analogWrite(ENA_PIN, DRIVE_SPEED);
-  analogWrite(ENB_PIN, DRIVE_SPEED);
-  digitalWrite(IN1_PIN, HIGH);
-  digitalWrite(IN2_PIN, LOW);
-  digitalWrite(IN3_PIN, HIGH);
-  digitalWrite(IN4_PIN, LOW);
-}
-
-void turnLeft() {
-  analogWrite(ENA_PIN, DRIVE_SPEED);
-  analogWrite(ENB_PIN, DRIVE_SPEED);
-  digitalWrite(IN1_PIN, LOW);
-  digitalWrite(IN2_PIN, HIGH);
-  digitalWrite(IN3_PIN, HIGH);
-  digitalWrite(IN4_PIN, LOW);
-}
-
-void turnRight() {
-  analogWrite(ENA_PIN, DRIVE_SPEED);
-  analogWrite(ENB_PIN, DRIVE_SPEED);
-  digitalWrite(IN1_PIN, HIGH);
-  digitalWrite(IN2_PIN, LOW);
-  digitalWrite(IN3_PIN, LOW);
-  digitalWrite(IN4_PIN, HIGH);
+void right(uint8_t speedVal) {
+  analogWrite(ENA, speedVal);
+  analogWrite(ENB, speedVal);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
 }
 
 void stopMotors() {
-  analogWrite(ENA_PIN, 0);
-  analogWrite(ENB_PIN, 0);
-  digitalWrite(IN1_PIN, LOW);
-  digitalWrite(IN2_PIN, LOW);
-  digitalWrite(IN3_PIN, LOW);
-  digitalWrite(IN4_PIN, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
 }
 
 void runAction(MotionAction action) {
-  if (action == ACTION_FORWARD) {
-    moveForward();
-  } else if (action == ACTION_LEFT) {
-    turnLeft();
-  } else if (action == ACTION_RIGHT) {
-    turnRight();
-  } else {
-    stopMotors();
-  }
+  if (action == ACTION_FORWARD) forward(MOTOR_SPEED);
+  else if (action == ACTION_BACK) back(MOTOR_SPEED);
+  else if (action == ACTION_LEFT) left(MOTOR_SPEED);
+  else if (action == ACTION_RIGHT) right(MOTOR_SPEED);
+  else stopMotors();
+
   activeAction = action;
 }
 
 // ----------------------------
-// 6) Sensor read
+// 5) Sensors
 // ----------------------------
+int lineRight() { return digitalRead(PIN_LT_R) == LOW; }
+int lineMid() { return digitalRead(PIN_LT_M) == LOW; }
+int lineLeft() { return digitalRead(PIN_LT_L) == LOW; }
+
 long readDistanceCM() {
-  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(PIN_TRIG, LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(20);
+  digitalWrite(PIN_TRIG, LOW);
 
-  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 25000UL);
+  unsigned long duration = pulseIn(PIN_ECHO, HIGH, 25000UL);
   if (duration == 0) return 400;
-  return (long)(duration * 0.0343 / 2.0);
+
+  long cm = (long)(duration / 58.0);
+  if (cm < 3) return 400;  // Ignore invalid near-zero spikes
+  return cm;
 }
 
 // ----------------------------
-// 7) QML-inspired steering policy
-// ----------------------------
-float qmlInspiredRightProbability(long distanceCm, float turnHint01) {
-  float d = (float)distanceCm;
-  if (d < 0.0f) d = 0.0f;
-  if (d > 100.0f) d = 100.0f;
-  float dNorm = d / 100.0f;
-
-  if (turnHint01 < 0.0f) turnHint01 = 0.0f;
-  if (turnHint01 > 1.0f) turnHint01 = 1.0f;
-
-  // Lightweight approximation of a learned score -> probability.
-  float z = -0.55f + (1.90f * turnHint01) - (0.95f * dNorm);
-  float p = 1.0f / (1.0f + expf(-3.0f * z));
-  if (p < 0.0f) p = 0.0f;
-  if (p > 1.0f) p = 1.0f;
-  return p;
-}
-
-MotionAction decideAutoAction(long distanceCm, float turnHint01) {
-  if (distanceCm <= STOP_DISTANCE_CM) return ACTION_STOP;
-  if (distanceCm > TURN_DISTANCE_CM) return ACTION_FORWARD;
-
-  float pRight = qmlInspiredRightProbability(distanceCm, turnHint01);
-  return (pRight >= 0.5f) ? ACTION_RIGHT : ACTION_LEFT;
-}
-
-// ----------------------------
-// 8) Heading + path conversion
+// 6) Pose / bounds
 // ----------------------------
 const char* headingName(Heading h) {
   if (h == HEADING_N) return "N";
@@ -256,190 +209,104 @@ Heading leftOf(Heading h) {
   return HEADING_N;
 }
 
-bool parsePointToken(const char* token, int* xOut, int* yOut) {
-  const char* comma = strchr(token, ',');
-  if (comma == NULL) return false;
-  int leftLen = (int)(comma - token);
-  if (leftLen <= 0 || leftLen > 10) return false;
-
-  char xBuf[12];
-  strncpy(xBuf, token, leftLen);
-  xBuf[leftLen] = '\0';
-
-  const char* yPart = comma + 1;
-  if (strlen(yPart) == 0 || strlen(yPart) > 10) return false;
-
-  *xOut = atoi(xBuf);
-  *yOut = atoi(yPart);
-  return true;
+bool inBounds(long x, long y) {
+  return x >= boundMinX && x <= boundMaxX && y >= boundMinY && y <= boundMaxY;
 }
 
-bool enqueueTurnSequence(Heading* h, Heading target) {
-  if (*h == target) return true;
-  if (rightOf(*h) == target) {
-    if (!enqueueAction(ACTION_RIGHT, TURN_STEP_MS)) return false;
-    *h = target;
-    return true;
+void forwardDelta(Heading h, int* dxOut, int* dyOut) {
+  if (h == HEADING_N) {
+    *dxOut = 0; *dyOut = -1;
+  } else if (h == HEADING_E) {
+    *dxOut = 1; *dyOut = 0;
+  } else if (h == HEADING_S) {
+    *dxOut = 0; *dyOut = 1;
+  } else {
+    *dxOut = -1; *dyOut = 0;
   }
-  if (leftOf(*h) == target) {
-    if (!enqueueAction(ACTION_LEFT, TURN_STEP_MS)) return false;
-    *h = target;
-    return true;
-  }
-
-  Heading first = rightOf(*h);
-  if (!enqueueAction(ACTION_RIGHT, TURN_STEP_MS)) return false;
-  if (!enqueueAction(ACTION_RIGHT, TURN_STEP_MS)) return false;
-  *h = rightOf(first);
-  return true;
 }
 
-bool enqueuePathMotion(char* spec) {
-  int xPrev = 0, yPrev = 0;
-  int xCur = 0, yCur = 0;
-  bool first = true;
-  Heading h = roverHeading;
+bool forwardWouldLeaveBounds() {
+  int dx = 0, dy = 0;
+  forwardDelta(heading, &dx, &dy);
+  return !inBounds(gridX + dx, gridY + dy);
+}
 
-  char* save = NULL;
-  char* token = strtok_r(spec, "|", &save);
-  while (token != NULL) {
-    if (!parsePointToken(token, &xCur, &yCur)) return false;
-
-    if (first) {
-      xPrev = xCur;
-      yPrev = yCur;
-      first = false;
-    } else {
-      int dx = xCur - xPrev;
-      int dy = yCur - yPrev;
-      Heading target;
-
-      if (dx == 1 && dy == 0) target = HEADING_E;
-      else if (dx == -1 && dy == 0) target = HEADING_W;
-      else if (dx == 0 && dy == 1) target = HEADING_S;
-      else if (dx == 0 && dy == -1) target = HEADING_N;
-      else return false;
-
-      if (!enqueueTurnSequence(&h, target)) return false;
-      if (!enqueueAction(ACTION_FORWARD, FORWARD_STEP_MS)) return false;
-
-      xPrev = xCur;
-      yPrev = yCur;
+void applyCompletedMotion(MotionAction action) {
+  if (action == ACTION_LEFT) {
+    heading = leftOf(heading);
+    return;
+  }
+  if (action == ACTION_RIGHT) {
+    heading = rightOf(heading);
+    return;
+  }
+  if (action == ACTION_FORWARD) {
+    int dx = 0, dy = 0;
+    forwardDelta(heading, &dx, &dy);
+    long nx = gridX + dx;
+    long ny = gridY + dy;
+    if (inBounds(nx, ny)) {
+      gridX = nx;
+      gridY = ny;
     }
-
-    token = strtok_r(NULL, "|", &save);
+    if (snakeFlipAfterForward) {
+      snakeMovingEast = !snakeMovingEast;
+      snakeFlipAfterForward = false;
+    }
   }
+}
 
-  roverHeading = h;
-  return !first;
+bool edgeDetectedStable() {
+  bool rawEdge = forwardWouldLeaveBounds();
+  if (useLineSensors) rawEdge = rawEdge || lineLeft() || lineMid() || lineRight();
+
+  if (rawEdge) {
+    if (edgeHitStreak < 255) edgeHitStreak++;
+  } else {
+    edgeHitStreak = 0;
+  }
+  return edgeHitStreak >= EDGE_HIT_CONFIRM_COUNT;
+}
+
+bool obstacleDetectedStable() {
+  bool nearObstacle = latestDistanceCm <= TURN_DISTANCE_CM;
+  if (nearObstacle) {
+    if (obstacleHitStreak < 255) obstacleHitStreak++;
+  } else {
+    obstacleHitStreak = 0;
+  }
+  return obstacleHitStreak >= OBSTACLE_HIT_CONFIRM_COUNT;
 }
 
 // ----------------------------
-// 9) Timed action lifecycle
+// 7) Timed actions
 // ----------------------------
-void startTimedAction(MotionAction action, unsigned long durationMs) {
-  if (durationMs > MAX_TIMED_MOVE_MS) durationMs = MAX_TIMED_MOVE_MS;
+void startTimedAction(MotionAction action, unsigned long ms) {
+  if (ms > MAX_TIMED_MOVE_MS) ms = MAX_TIMED_MOVE_MS;
   runAction(action);
-  timedActionEndsAt = millis() + durationMs;
+  timedActionEndsAt = millis() + ms;
   timedActionActive = true;
 }
 
-void stopAllMotion() {
+void stopAll() {
   stopMotors();
   timedActionActive = false;
   timedActionEndsAt = 0;
   activeAction = ACTION_STOP;
 }
 
-void serviceTimedActionQueue(unsigned long now) {
+void serviceTimedAction(unsigned long now) {
   if (timedActionActive && now >= timedActionEndsAt) {
-    stopAllMotion();
+    applyCompletedMotion(activeAction);
+    stopAll();
     Serial.println("DONE");
   }
-
-  if (!timedActionActive && !queueIsEmpty()) {
-    TimedAction next;
-    if (dequeueAction(&next)) {
-      startTimedAction(next.action, next.durationMs);
-      Serial.print("ACK:RUN:");
-      Serial.print((next.action == ACTION_FORWARD) ? "FORWARD" : (next.action == ACTION_LEFT) ? "LEFT" : "RIGHT");
-      Serial.print(":");
-      Serial.println(next.durationMs);
-    }
-  }
 }
 
 // ----------------------------
-// 10) Command parsing
+// 8) Serial parsing
 // ----------------------------
-bool parseTimedCommand(const char* command, MotionAction* actionOut, unsigned long* durationOut) {
-  const char* colon = strchr(command, ':');
-  if (colon == NULL) return false;
-
-  int actionLen = (int)(colon - command);
-  if (actionLen <= 0 || actionLen > 10) return false;
-
-  char actionName[12];
-  strncpy(actionName, command, actionLen);
-  actionName[actionLen] = '\0';
-
-  long parsed = atol(colon + 1);
-  if (parsed <= 0) return false;
-
-  if (strcmp(actionName, "FORWARD") == 0) *actionOut = ACTION_FORWARD;
-  else if (strcmp(actionName, "LEFT") == 0) *actionOut = ACTION_LEFT;
-  else if (strcmp(actionName, "RIGHT") == 0) *actionOut = ACTION_RIGHT;
-  else return false;
-
-  *durationOut = (unsigned long)parsed;
-  return true;
-}
-
-void setMode(ControlMode newMode) {
-  mode = newMode;
-  clearQueue();
-  stopAllMotion();
-  Serial.println(mode == MODE_AUTO ? "MODE:AUTO" : "MODE:MANUAL");
-}
-
-void processManualMotionCommand(const char* command) {
-  lastCommandTime = millis();
-
-  if (strcmp(command, "STOP") == 0) {
-    clearQueue();
-    stopAllMotion();
-    Serial.println("ACK:STOP");
-    return;
-  }
-
-  if (strcmp(command, "FORWARD") == 0 || strcmp(command, "LEFT") == 0 || strcmp(command, "RIGHT") == 0) {
-    MotionAction a = (strcmp(command, "FORWARD") == 0) ? ACTION_FORWARD : (strcmp(command, "LEFT") == 0) ? ACTION_LEFT : ACTION_RIGHT;
-    clearQueue();
-    stopAllMotion();
-    runAction(a);
-    Serial.print("ACK:");
-    Serial.println(command);
-    return;
-  }
-
-  MotionAction timedAction;
-  unsigned long durationMs = 0;
-  if (parseTimedCommand(command, &timedAction, &durationMs)) {
-    clearQueue();
-    stopAllMotion();
-    startTimedAction(timedAction, durationMs);
-    Serial.print("ACK:");
-    Serial.print((timedAction == ACTION_FORWARD) ? "FORWARD" : (timedAction == ACTION_LEFT) ? "LEFT" : "RIGHT");
-    Serial.print(":");
-    Serial.println(durationMs);
-    return;
-  }
-
-  Serial.print("ERR:UNKNOWN:");
-  Serial.println(command);
-}
-
-bool parseHeadingChar(char c, Heading* out) {
+bool parseHeading(char c, Heading* out) {
   if (c == 'N') *out = HEADING_N;
   else if (c == 'E') *out = HEADING_E;
   else if (c == 'S') *out = HEADING_S;
@@ -448,48 +315,145 @@ bool parseHeadingChar(char c, Heading* out) {
   return true;
 }
 
-void processSystemCommand(char* command) {
-  if (strcmp(command, "PING") == 0) {
+bool parseTimed(const char* cmd, MotionAction* actionOut, unsigned long* msOut) {
+  const char* colon = strchr(cmd, ':');
+  if (colon == NULL) return false;
+
+  int n = (int)(colon - cmd);
+  if (n <= 0 || n > 10) return false;
+
+  char name[12];
+  strncpy(name, cmd, n);
+  name[n] = '\0';
+
+  long ms = atol(colon + 1);
+  if (ms <= 0) return false;
+
+  if (strcmp(name, "FORWARD") == 0) *actionOut = ACTION_FORWARD;
+  else if (strcmp(name, "BACK") == 0) *actionOut = ACTION_BACK;
+  else if (strcmp(name, "LEFT") == 0) *actionOut = ACTION_LEFT;
+  else if (strcmp(name, "RIGHT") == 0) *actionOut = ACTION_RIGHT;
+  else return false;
+
+  *msOut = (unsigned long)ms;
+  return true;
+}
+
+bool parseBounds(char* spec, long* minX, long* maxX, long* minY, long* maxY) {
+  long v[4];
+  byte i = 0;
+  char* save = NULL;
+  char* tok = strtok_r(spec, ",", &save);
+  while (tok != NULL && i < 4) {
+    v[i++] = atol(tok);
+    tok = strtok_r(NULL, ",", &save);
+  }
+  if (i != 4 || tok != NULL) return false;
+  if (v[0] > v[1] || v[2] > v[3]) return false;
+
+  *minX = v[0]; *maxX = v[1]; *minY = v[2]; *maxY = v[3];
+  return true;
+}
+
+bool parseXY(char* spec, long* x, long* y) {
+  char* save = NULL;
+  char* xTok = strtok_r(spec, ",", &save);
+  char* yTok = strtok_r(NULL, ",", &save);
+  if (xTok == NULL || yTok == NULL) return false;
+
+  *x = atol(xTok);
+  *y = atol(yTok);
+  return true;
+}
+
+void setMode(ControlMode newMode) {
+  mode = newMode;
+  stopAll();
+  Serial.println(mode == MODE_AUTO ? "MODE:AUTO" : "MODE:MANUAL");
+}
+
+void processMotionCommand(const char* cmd) {
+  lastCommandTime = millis();
+
+  if (strcmp(cmd, "STOP") == 0) {
+    stopAll();
+    Serial.println("ACK:STOP");
+    return;
+  }
+
+  if (strcmp(cmd, "FORWARD") == 0 || strcmp(cmd, "BACK") == 0 || strcmp(cmd, "LEFT") == 0 || strcmp(cmd, "RIGHT") == 0) {
+    MotionAction a = ACTION_STOP;
+    if (strcmp(cmd, "FORWARD") == 0) a = ACTION_FORWARD;
+    else if (strcmp(cmd, "BACK") == 0) a = ACTION_BACK;
+    else if (strcmp(cmd, "LEFT") == 0) a = ACTION_LEFT;
+    else a = ACTION_RIGHT;
+
+    stopAll();
+    runAction(a);
+    Serial.print("ACK:");
+    Serial.println(cmd);
+    return;
+  }
+
+  MotionAction a;
+  unsigned long ms;
+  if (parseTimed(cmd, &a, &ms)) {
+    stopAll();
+    startTimedAction(a, ms);
+    Serial.print("ACK:");
+    Serial.print((a == ACTION_FORWARD) ? "FORWARD" : (a == ACTION_BACK) ? "BACK" : (a == ACTION_LEFT) ? "LEFT" : "RIGHT");
+    Serial.print(":");
+    Serial.println(ms);
+    return;
+  }
+
+  Serial.print("ERR:UNKNOWN:");
+  Serial.println(cmd);
+}
+
+void processCommand(char* cmd) {
+  if (strcmp(cmd, "PING") == 0) {
     Serial.println("PONG");
     return;
   }
 
-  if (strcmp(command, "MODE:AUTO") == 0) {
+  if (strcmp(cmd, "MODE:AUTO") == 0) {
     setMode(MODE_AUTO);
     return;
   }
-
-  if (strcmp(command, "MODE:MANUAL") == 0) {
+  if (strcmp(cmd, "MODE:MANUAL") == 0) {
     setMode(MODE_MANUAL);
     return;
   }
 
-  if (strncmp(command, "SET:STOP:", 9) == 0) {
-    long v = atol(command + 9);
-    if (v >= 5 && v <= 100) {
+  if (strncmp(cmd, "SET:STOP:", 9) == 0) {
+    long v = atol(cmd + 9);
+    if (v >= 5 && v <= 120) {
       STOP_DISTANCE_CM = v;
       Serial.print("ACK:SET:STOP:");
       Serial.println(STOP_DISTANCE_CM);
+      obstacleHitStreak = 0;
     } else {
       Serial.println("ERR:SET:STOP");
     }
     return;
   }
 
-  if (strncmp(command, "SET:TURN:", 9) == 0) {
-    long v = atol(command + 9);
-    if (v > STOP_DISTANCE_CM && v <= 200) {
+  if (strncmp(cmd, "SET:TURN:", 9) == 0) {
+    long v = atol(cmd + 9);
+    if (v > STOP_DISTANCE_CM && v <= 250) {
       TURN_DISTANCE_CM = v;
       Serial.print("ACK:SET:TURN:");
       Serial.println(TURN_DISTANCE_CM);
+      obstacleHitStreak = 0;
     } else {
       Serial.println("ERR:SET:TURN");
     }
     return;
   }
 
-  if (strncmp(command, "SET:FORWARD_MS:", 15) == 0) {
-    long v = atol(command + 15);
+  if (strncmp(cmd, "SET:FORWARD_MS:", 15) == 0) {
+    long v = atol(cmd + 15);
     if (v >= 80 && v <= (long)MAX_TIMED_MOVE_MS) {
       FORWARD_STEP_MS = (unsigned long)v;
       Serial.print("ACK:SET:FORWARD_MS:");
@@ -500,8 +464,8 @@ void processSystemCommand(char* command) {
     return;
   }
 
-  if (strncmp(command, "SET:TURN_MS:", 12) == 0) {
-    long v = atol(command + 12);
+  if (strncmp(cmd, "SET:TURN_MS:", 12) == 0) {
+    long v = atol(cmd + 12);
     if (v >= 80 && v <= (long)MAX_TIMED_MOVE_MS) {
       TURN_STEP_MS = (unsigned long)v;
       Serial.print("ACK:SET:TURN_MS:");
@@ -512,54 +476,103 @@ void processSystemCommand(char* command) {
     return;
   }
 
-  if (strncmp(command, "SET:HEADING:", 12) == 0) {
+  if (strncmp(cmd, "SET:HEADING:", 12) == 0) {
     Heading h;
-    if (parseHeadingChar(command[12], &h)) {
-      roverHeading = h;
+    if (parseHeading(cmd[12], &h)) {
+      heading = h;
       Serial.print("ACK:SET:HEADING:");
-      Serial.println(headingName(roverHeading));
+      Serial.println(headingName(heading));
     } else {
       Serial.println("ERR:SET:HEADING");
     }
     return;
   }
 
-  if (strncmp(command, "QTURN:", 6) == 0) {
-    int hintInt = atoi(command + 6);
-    if (hintInt < 0) hintInt = 0;
-    if (hintInt > 100) hintInt = 100;
-    float hint = ((float)hintInt) / 100.0f;
-
-    MotionAction turnAction = decideAutoAction(latestDistanceCm, hint);
-    if (turnAction == ACTION_LEFT || turnAction == ACTION_RIGHT) {
-      clearQueue();
-      stopAllMotion();
-      startTimedAction(turnAction, TURN_STEP_MS);
-      Serial.print("ACK:QTURN:");
-      Serial.println((turnAction == ACTION_RIGHT) ? "RIGHT" : "LEFT");
+  if (strncmp(cmd, "SET:BOUNDS:", 11) == 0) {
+    long minX, maxX, minY, maxY;
+    if (parseBounds(cmd + 11, &minX, &maxX, &minY, &maxY)) {
+      boundMinX = minX;
+      boundMaxX = maxX;
+      boundMinY = minY;
+      boundMaxY = maxY;
+      if (!inBounds(gridX, gridY)) {
+        gridX = boundMinX;
+        gridY = boundMinY;
+      }
+      edgeHitStreak = 0;
+      Serial.print("ACK:SET:BOUNDS:");
+      Serial.print(boundMinX); Serial.print(",");
+      Serial.print(boundMaxX); Serial.print(",");
+      Serial.print(boundMinY); Serial.print(",");
+      Serial.println(boundMaxY);
     } else {
-      Serial.println("ACK:QTURN:NONE");
+      Serial.println("ERR:SET:BOUNDS");
     }
     return;
   }
 
-  if (strncmp(command, "PATH:", 5) == 0) {
-    clearQueue();
-    stopAllMotion();
-    bool ok = enqueuePathMotion(command + 5);
-    if (ok) {
-      Serial.print("ACK:PATH:QSIZE:");
-      byte size = (actionQueueTail + ACTION_QUEUE_SIZE - actionQueueHead) % ACTION_QUEUE_SIZE;
-      Serial.println(size);
+  if (strncmp(cmd, "SET:POS:", 8) == 0) {
+    long x, y;
+    if (parseXY(cmd + 8, &x, &y) && inBounds(x, y)) {
+      gridX = x;
+      gridY = y;
+      edgeHitStreak = 0;
+      Serial.print("ACK:SET:POS:");
+      Serial.print(gridX); Serial.print(",");
+      Serial.println(gridY);
     } else {
-      clearQueue();
-      Serial.println("ERR:PATH");
+      Serial.println("ERR:SET:POS");
     }
     return;
   }
 
-  // Default motion command handling.
-  processManualMotionCommand(command);
+  if (strncmp(cmd, "SET:LINE:", 9) == 0) {
+    int v = atoi(cmd + 9);
+    if (v == 0 || v == 1) {
+      useLineSensors = (v == 1);
+      edgeHitStreak = 0;
+      Serial.print("ACK:SET:LINE:");
+      Serial.println(useLineSensors ? 1 : 0);
+    } else {
+      Serial.println("ERR:SET:LINE");
+    }
+    return;
+  }
+
+  if (strncmp(cmd, "SET:SNAKE:", 10) == 0) {
+    int v = atoi(cmd + 10);
+    if (v == 0 || v == 1) {
+      snakeModeEnabled = (v == 1);
+      snakeFinished = false;
+      snakeFlipAfterForward = false;
+      Serial.print("ACK:SET:SNAKE:");
+      Serial.println(snakeModeEnabled ? 1 : 0);
+    } else {
+      Serial.println("ERR:SET:SNAKE");
+    }
+    return;
+  }
+
+  if (strcmp(cmd, "GET:STATE") == 0) {
+    Serial.print("STATE:POS:");
+    Serial.print(gridX); Serial.print(",");
+    Serial.print(gridY); Serial.print(";HEADING:");
+    Serial.print(headingName(heading));
+    Serial.print(";BOUNDS:");
+    Serial.print(boundMinX); Serial.print(",");
+    Serial.print(boundMaxX); Serial.print(",");
+    Serial.print(boundMinY); Serial.print(",");
+    Serial.print(boundMaxY);
+    Serial.print(";LINE:");
+    Serial.print(useLineSensors ? 1 : 0);
+    Serial.print(";SNAKE:");
+    Serial.print(snakeModeEnabled ? 1 : 0);
+    Serial.print(";DIR:");
+    Serial.println(snakeMovingEast ? "EAST" : "WEST");
+    return;
+  }
+
+  processMotionCommand(cmd);
 }
 
 void pollSerial() {
@@ -568,7 +581,7 @@ void pollSerial() {
     if (c == '\n' || c == '\r') {
       if (cmdIndex > 0) {
         cmdBuffer[cmdIndex] = '\0';
-        processSystemCommand(cmdBuffer);
+        processCommand(cmdBuffer);
         cmdIndex = 0;
       }
     } else if (cmdIndex < sizeof(cmdBuffer) - 1) {
@@ -581,52 +594,99 @@ void pollSerial() {
 }
 
 // ----------------------------
-// 11) Autonomous loop
+// 9) Autonomous policy
 // ----------------------------
 void autoDecideAndDrive() {
-  // Let queued/timed actions finish before issuing a new policy decision.
-  if (timedActionActive || !queueIsEmpty()) return;
+  if (timedActionActive) return;
 
-  MotionAction decision;
-  if (latestDistanceCm <= STOP_DISTANCE_CM) {
-    // Close obstacle: stronger turn burst, alternating direction.
-    decision = turnLeftNext ? ACTION_LEFT : ACTION_RIGHT;
-    turnLeftNext = !turnLeftNext;
-    startTimedAction(decision, AUTO_ESCAPE_TURN_MS);
-    return;
-  }
-
-  if (latestDistanceCm <= TURN_DISTANCE_CM) {
-    // Caution zone: use QML-inspired gate with alternating hint.
-    float hint = turnLeftNext ? 0.0f : 1.0f;
-    decision = decideAutoAction(latestDistanceCm, hint);
-    if (decision != ACTION_LEFT && decision != ACTION_RIGHT) {
-      decision = turnLeftNext ? ACTION_LEFT : ACTION_RIGHT;
+  if (snakeModeEnabled) {
+    if (snakeFinished) {
+      stopAll();
+      return;
     }
-    turnLeftNext = !turnLeftNext;
-    startTimedAction(decision, AUTO_CAUTION_TURN_MS);
+
+    Heading rowHeading = snakeMovingEast ? HEADING_E : HEADING_W;
+    Heading rowStepHeading = (snakeRowStep > 0) ? HEADING_S : HEADING_N;
+    bool atRowEdge = snakeMovingEast ? (gridX >= boundMaxX) : (gridX <= boundMinX);
+
+    if (!atRowEdge) {
+      if (heading != rowHeading) {
+        MotionAction turnAction = (rightOf(heading) == rowHeading) ? ACTION_RIGHT : ACTION_LEFT;
+        startTimedAction(turnAction, TURN_STEP_MS);
+      } else {
+        startTimedAction(ACTION_FORWARD, FORWARD_STEP_MS);
+      }
+      return;
+    }
+
+    bool canStepRow = (snakeRowStep > 0) ? (gridY < boundMaxY) : (gridY > boundMinY);
+    if (!canStepRow) {
+      snakeFinished = true;
+      stopAll();
+      Serial.println("ACK:SNAKE:DONE");
+      return;
+    }
+
+    if (heading != rowStepHeading) {
+      MotionAction turnAction = (rightOf(heading) == rowStepHeading) ? ACTION_RIGHT : ACTION_LEFT;
+      startTimedAction(turnAction, TURN_STEP_MS);
+    } else {
+      snakeFlipAfterForward = true;
+      startTimedAction(ACTION_FORWARD, FORWARD_STEP_MS);
+    }
     return;
   }
 
-  runAction(ACTION_FORWARD);
+  // Fallback obstacle-aware mode when snake is disabled.
+  if (edgeDetectedStable()) {
+    MotionAction turnAction = turnLeftNext ? ACTION_LEFT : ACTION_RIGHT;
+    turnLeftNext = !turnLeftNext;
+    startTimedAction(turnAction, TURN_STEP_MS);
+    return;
+  }
+
+  if (latestDistanceCm <= STOP_DISTANCE_CM) {
+    MotionAction turnAction = turnLeftNext ? ACTION_LEFT : ACTION_RIGHT;
+    turnLeftNext = !turnLeftNext;
+    startTimedAction(turnAction, ESCAPE_TURN_MS);
+    return;
+  }
+
+  if (obstacleDetectedStable()) {
+    MotionAction turnAction = turnLeftNext ? ACTION_LEFT : ACTION_RIGHT;
+    turnLeftNext = !turnLeftNext;
+    startTimedAction(turnAction, TURN_STEP_MS);
+    return;
+  }
+
+  startTimedAction(ACTION_FORWARD, FORWARD_STEP_MS);
 }
 
 // ----------------------------
-// 12) Arduino lifecycle
+// 10) Arduino lifecycle
 // ----------------------------
 void setup() {
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-
-  pinMode(ENA_PIN, OUTPUT);
-  pinMode(IN1_PIN, OUTPUT);
-  pinMode(IN2_PIN, OUTPUT);
-  pinMode(ENB_PIN, OUTPUT);
-  pinMode(IN3_PIN, OUTPUT);
-  pinMode(IN4_PIN, OUTPUT);
+  scanServo.attach(PIN_SERVO, 700, 2400);
+  scanServo.write(90);
 
   Serial.begin(9600);
-  stopAllMotion();
+
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_TRIG, OUTPUT);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  // Active-low sensors are usually stable with pullups.
+  pinMode(PIN_LT_R, INPUT_PULLUP);
+  pinMode(PIN_LT_M, INPUT_PULLUP);
+  pinMode(PIN_LT_L, INPUT_PULLUP);
+
+  stopAll();
   lastCommandTime = millis();
 
   Serial.println("READY");
@@ -635,11 +695,10 @@ void setup() {
 
 void loop() {
   pollSerial();
+
   unsigned long now = millis();
+  serviceTimedAction(now);
 
-  serviceTimedActionQueue(now);
-
-  // Publish distance for telemetry/debug (same as Python contract: DIST:<cm>).
   if (now - lastSensorTime >= SENSOR_PERIOD_MS) {
     latestDistanceCm = readDistanceCM();
     Serial.print("DIST:");
@@ -653,9 +712,12 @@ void loop() {
       lastDecisionTime = now;
     }
   } else {
-    // Safety timeout for manual mode when no queued/timed action is running.
-    if ((now - lastCommandTime > CMD_TIMEOUT_MS) && !timedActionActive && queueIsEmpty()) {
-      stopAllMotion();
+    if ((now - lastCommandTime > CMD_TIMEOUT_MS) && !timedActionActive) {
+      stopAll();
     }
   }
 }
+
+
+
+
