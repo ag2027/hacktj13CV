@@ -45,7 +45,7 @@ Servo scanServo;
 // ----------------------------
 // 2) Control config
 // ----------------------------
-const int MOTOR_SPEED = 220;
+const int MOTOR_SPEED = 180;
 const int FORWARD_LEFT_TRIM = 20;  // Left side slower by this amount to correct drift.
 const unsigned long SENSOR_PERIOD_MS = 120;
 const unsigned long DECISION_PERIOD_MS = 120;
@@ -58,9 +58,11 @@ const byte OBSTACLE_HIT_CONFIRM_COUNT = 2;
 
 long STOP_DISTANCE_CM = 12;
 long TURN_DISTANCE_CM = 30;
+long ULTRA_AVOID_DISTANCE_CM = 10;
 
-unsigned long FORWARD_STEP_MS = 420;
-unsigned long TURN_STEP_MS = 432;
+unsigned long FORWARD_STEP_MS = 500;
+unsigned long BYPASS_FORWARD_MS = 620;  // Extra clearance distance during obstacle bypass.
+unsigned long TURN_STEP_MS = 520;
 unsigned long ESCAPE_TURN_MS = 432;
 
 // ----------------------------
@@ -76,7 +78,7 @@ Heading heading = HEADING_E;
 long gridX = 0;
 long gridY = 0;
 long boundMinX = 0;
-long boundMaxX = 5;
+long boundMaxX = 6;
 long boundMinY = 0;
 long boundMaxY = 1;
 
@@ -89,6 +91,9 @@ bool snakeMovingEast = true;
 int snakeRowStep = 1;
 bool snakeFlipAfterForward = false;
 bool snakeFinished = false;
+bool ultraBypassActive = false;
+bool ultraBypassRightSide = true;
+byte ultraBypassStep = 0;
 
 unsigned long lastSensorTime = 0;
 unsigned long lastDecisionTime = 0;
@@ -277,6 +282,81 @@ bool obstacleDetectedStable() {
   }
   return obstacleHitStreak >= OBSTACLE_HIT_CONFIRM_COUNT;
 }
+
+MotionAction bypassActionForStep(byte step, bool rightSide) {
+  // Right-side bypass:
+  // RIGHT, FORWARD, LEFT, FORWARD, LEFT, FORWARD, RIGHT
+  // Left-side bypass is mirrored.
+  if (rightSide) {
+    if (step == 0) return ACTION_RIGHT;
+    if (step == 1) return ACTION_FORWARD;
+    if (step == 2) return ACTION_LEFT;
+    if (step == 3) return ACTION_FORWARD;
+    if (step == 4) return ACTION_LEFT;
+    if (step == 5) return ACTION_FORWARD;
+    return ACTION_RIGHT;
+  }
+
+  if (step == 0) return ACTION_LEFT;
+  if (step == 1) return ACTION_FORWARD;
+  if (step == 2) return ACTION_RIGHT;
+  if (step == 3) return ACTION_FORWARD;
+  if (step == 4) return ACTION_RIGHT;
+  if (step == 5) return ACTION_FORWARD;
+  return ACTION_LEFT;
+}
+
+bool simulateActionStep(long x, long y, Heading h, MotionAction action, long* xOut, long* yOut, Heading* hOut) {
+  long nx = x;
+  long ny = y;
+  Heading nh = h;
+
+  if (action == ACTION_LEFT) {
+    nh = leftOf(h);
+  } else if (action == ACTION_RIGHT) {
+    nh = rightOf(h);
+  } else if (action == ACTION_FORWARD) {
+    int dx = 0;
+    int dy = 0;
+    forwardDelta(h, &dx, &dy);
+    nx = x + dx;
+    ny = y + dy;
+    if (!inBounds(nx, ny)) {
+      return false;
+    }
+  }
+
+  *xOut = nx;
+  *yOut = ny;
+  *hOut = nh;
+  return true;
+}
+
+bool canExecuteBypass(bool rightSide) {
+  long x = gridX;
+  long y = gridY;
+  Heading h = heading;
+
+  for (byte i = 0; i < 7; i++) {
+    MotionAction a = bypassActionForStep(i, rightSide);
+    if (!simulateActionStep(x, y, h, a, &x, &y, &h)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+unsigned long bypassDurationForStep(byte step, MotionAction action) {
+  if (action != ACTION_FORWARD) return TURN_STEP_MS;
+  // Sequence: R, F, L, F, L, F, R
+  // Make the first bypass forward (right/left then forward) longer to avoid clipping.
+  if (step == 1) return (BYPASS_FORWARD_MS * 3UL) / 2UL;
+  // Keep the middle forward leg (step 3) longer for cleaner front clearance.
+  if (step == 3) return (BYPASS_FORWARD_MS * 3UL) / 2UL;
+  return BYPASS_FORWARD_MS;
+}
+
 
 // ----------------------------
 // 7) Timed actions
@@ -605,6 +685,39 @@ void autoDecideAndDrive() {
       return;
     }
 
+    // Continue a multi-step bypass if already active.
+    if (ultraBypassActive) {
+      MotionAction nextBypassAction = bypassActionForStep(ultraBypassStep, ultraBypassRightSide);
+      unsigned long dur = bypassDurationForStep(ultraBypassStep, nextBypassAction);
+      startTimedAction(nextBypassAction, dur);
+      ultraBypassStep++;
+      if (ultraBypassStep >= 7) {
+        ultraBypassActive = false;
+        ultraBypassStep = 0;
+      }
+      return;
+    }
+
+    // On ultrasonic trigger, start bypass sequence around the obstacle.
+    if (latestDistanceCm <= ULTRA_AVOID_DISTANCE_CM) {
+      bool rightOK = canExecuteBypass(true);
+      bool leftOK = canExecuteBypass(false);
+
+      if (rightOK || leftOK) {
+        ultraBypassRightSide = rightOK ? true : false;
+        ultraBypassActive = true;
+        ultraBypassStep = 0;
+
+        MotionAction firstAction = bypassActionForStep(ultraBypassStep, ultraBypassRightSide);
+        unsigned long firstDur = bypassDurationForStep(ultraBypassStep, firstAction);
+        startTimedAction(firstAction, firstDur);
+        ultraBypassStep++;
+      } else {
+        // Tight corner fallback.
+        startTimedAction(ACTION_RIGHT, TURN_STEP_MS);
+      }
+      return;
+    }
     Heading rowHeading = snakeMovingEast ? HEADING_E : HEADING_W;
     Heading rowStepHeading = (snakeRowStep > 0) ? HEADING_S : HEADING_N;
     bool atRowEdge = snakeMovingEast ? (gridX >= boundMaxX) : (gridX <= boundMinX);
@@ -717,6 +830,12 @@ void loop() {
     }
   }
 }
+
+
+
+
+
+
 
 
 
