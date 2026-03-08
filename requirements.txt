@@ -3,3 +3,9 @@ flask
 pennylane
 groq
 python-dotenv
+ultralytics
+opencv-python
+matplotlib
+numpy
+mediapipe==0.10.14
+Pillow
