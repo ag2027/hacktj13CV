@@ -32,6 +32,7 @@ class GatewayState:
         self.qml_status = "unknown"
         self.camera_error = None
         self.cv_error = None
+        self.droidcam_stream_url = None
         self.latest_feed = {
             "type": "feed",
             "seq": 0,
@@ -86,6 +87,7 @@ class GatewayState:
                 "camera": {"status": self.camera_status, "error": self.camera_error},
                 "cv": {"status": self.cv_status, "error": self.cv_error},
                 "qml": {"status": self.qml_status},
+                "droidcam_stream_url": self.droidcam_stream_url,
                 "feed_seq": self.latest_feed["seq"],
                 "cv_stats": dict(self.cv_stats),
             }
@@ -308,6 +310,7 @@ def build_app(args):
     app.state.gateway = state
     app.state.cv_adapter = cv_adapter
     app.state.qml_base_url = args.qml_base_url.rstrip("/")
+    state.droidcam_stream_url = args.droidcam_stream_url
 
     @app.on_event("startup")
     async def on_startup():
@@ -433,6 +436,7 @@ def parse_args():
     parser.add_argument("--process-every-n", type=int, default=int(os.environ.get("DROIDCAM_PROCESS_EVERY_N", "6")))
     parser.add_argument("--jpeg-quality", type=int, default=int(os.environ.get("GATEWAY_JPEG_QUALITY", "80")))
     parser.add_argument("--qml-base-url", default=os.environ.get("QML_BASE_URL", "http://127.0.0.1:8000"))
+    parser.add_argument("--droidcam-stream-url", default=os.environ.get("DROIDCAM_STREAM_URL", ""))
     return parser.parse_args()
 
 
@@ -444,3 +448,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
