@@ -9,3 +9,6 @@ matplotlib
 numpy
 mediapipe==0.10.14
 Pillow
+fastapi
+uvicorn
+httpx
