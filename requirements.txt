@@ -1,3 +1,4 @@
 pyserial
 flask
 pennylane
+groq
