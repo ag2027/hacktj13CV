@@ -1,0 +1,65 @@
+{
+  "dataset_name": "GTMK Rover Navigation Demo Dataset",
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "case_alpha",
+      "title": "Bridge access corridor",
+      "map": {"width": 14, "height": 10},
+      "robot": {"start": {"x": 1, "y": 1}, "goal": {"x": 12, "y": 8}},
+      "points": [
+        {"id": "p1", "x": 3, "y": 1, "kind": "observation", "flagged": false, "blocked": false, "risk": 0.10},
+        {"id": "p2", "x": 4, "y": 2, "kind": "hazard", "flagged": true, "blocked": true, "risk": 0.92},
+        {"id": "p3", "x": 4, "y": 3, "kind": "hazard", "flagged": true, "blocked": true, "risk": 0.88},
+        {"id": "p4", "x": 4, "y": 4, "kind": "hazard", "flagged": true, "blocked": false, "risk": 0.71},
+        {"id": "p5", "x": 6, "y": 6, "kind": "marker", "flagged": false, "blocked": false, "risk": 0.18},
+        {"id": "p6", "x": 8, "y": 5, "kind": "hazard", "flagged": true, "blocked": false, "risk": 0.65},
+        {"id": "p7", "x": 10, "y": 7, "kind": "marker", "flagged": false, "blocked": false, "risk": 0.08}
+      ],
+      "expected": {
+        "flagged_point_ids": ["p2", "p3", "p4", "p6"],
+        "navigation_outcome": "reroute_required",
+        "reachable": true
+      }
+    },
+    {
+      "id": "case_beta",
+      "title": "Narrow field crossing",
+      "map": {"width": 16, "height": 11},
+      "robot": {"start": {"x": 2, "y": 9}, "goal": {"x": 13, "y": 1}},
+      "points": [
+        {"id": "q1", "x": 5, "y": 8, "kind": "hazard", "flagged": true, "blocked": true, "risk": 0.97},
+        {"id": "q2", "x": 6, "y": 8, "kind": "hazard", "flagged": true, "blocked": true, "risk": 0.95},
+        {"id": "q3", "x": 7, "y": 8, "kind": "hazard", "flagged": true, "blocked": true, "risk": 0.96},
+        {"id": "q4", "x": 8, "y": 8, "kind": "hazard", "flagged": true, "blocked": true, "risk": 0.93},
+        {"id": "q5", "x": 9, "y": 8, "kind": "hazard", "flagged": true, "blocked": true, "risk": 0.94},
+        {"id": "q6", "x": 10, "y": 7, "kind": "marker", "flagged": false, "blocked": false, "risk": 0.16},
+        {"id": "q7", "x": 11, "y": 5, "kind": "hazard", "flagged": true, "blocked": false, "risk": 0.74},
+        {"id": "q8", "x": 12, "y": 3, "kind": "marker", "flagged": false, "blocked": false, "risk": 0.11}
+      ],
+      "expected": {
+        "flagged_point_ids": ["q1", "q2", "q3", "q4", "q5", "q7"],
+        "navigation_outcome": "inaccessible_path",
+        "reachable": false
+      }
+    },
+    {
+      "id": "case_gamma",
+      "title": "Open perimeter scan",
+      "map": {"width": 12, "height": 9},
+      "robot": {"start": {"x": 1, "y": 7}, "goal": {"x": 10, "y": 1}},
+      "points": [
+        {"id": "r1", "x": 3, "y": 6, "kind": "marker", "flagged": false, "blocked": false, "risk": 0.12},
+        {"id": "r2", "x": 4, "y": 5, "kind": "marker", "flagged": false, "blocked": false, "risk": 0.18},
+        {"id": "r3", "x": 6, "y": 4, "kind": "hazard", "flagged": true, "blocked": false, "risk": 0.59},
+        {"id": "r4", "x": 8, "y": 3, "kind": "marker", "flagged": false, "blocked": false, "risk": 0.14},
+        {"id": "r5", "x": 9, "y": 2, "kind": "marker", "flagged": false, "blocked": false, "risk": 0.06}
+      ],
+      "expected": {
+        "flagged_point_ids": ["r3"],
+        "navigation_outcome": "pass",
+        "reachable": true
+      }
+    }
+  ]
+}

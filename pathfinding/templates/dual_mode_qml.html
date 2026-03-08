@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dual Mode QML Rover Demo</title>
+  <style>
+    :root {
+      --bg: #efe9db;
+      --panel: #fffaf0;
+      --ink: #1f2933;
+      --muted: #5b6773;
+      --accent: #0f766e;
+      --accent-2: #b45309;
+      --path: #0284c7;
+      --haz: #c81e1e;
+      --safe: #64748b;
+      --blocked: #111827;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Georgia, serif; background: linear-gradient(180deg,#fbf6ea,#efe9db); color: var(--ink); }
+    .app { display:grid; grid-template-columns: 1.45fr .95fr; gap:18px; padding:18px; min-height:100vh; }
+    .panel { background: rgba(255,250,240,.96); border:1px solid rgba(0,0,0,.08); border-radius:18px; box-shadow: 0 16px 42px rgba(31,41,51,.12); overflow:hidden; }
+    .hero { padding:18px 20px 10px; border-bottom:1px solid rgba(0,0,0,.08); }
+    .hero h1 { margin:0; font-size:1.55rem; }
+    .hero p { margin:8px 0 0; color:var(--muted); }
+    .toolbar { padding:12px 20px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; border-bottom:1px solid rgba(0,0,0,.08); }
+    .tabs { display:flex; gap:8px; }
+    .tab { border:0; border-radius:999px; padding:10px 14px; cursor:pointer; background:#334155; color:#fff; }
+    .tab.active { background: var(--accent); }
+    button, select, input { font: inherit; }
+    .toolbar button.action { border:0; border-radius:999px; padding:10px 14px; cursor:pointer; background:var(--accent-2); color:#fff; }
+    .toolbar button.action:disabled, .tab:disabled { opacity:.6; cursor:not-allowed; }
+    .toolbar label { color:var(--muted); font-size:.92rem; }
+    .left { display:grid; grid-template-rows:auto auto 1fr; }
+    .canvas-wrap { position:relative; padding:18px; min-height:700px; }
+    canvas { width:100%; min-height:650px; display:block; border-radius:14px; background:#fdfaf4; border:1px solid rgba(0,0,0,.08); }
+    .overlay { position:absolute; left:34px; right:34px; bottom:34px; display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+    .mini { background:rgba(255,250,240,.93); border:1px solid rgba(0,0,0,.08); border-radius:14px; padding:10px 12px; }
+    .mini h3 { margin:0 0 8px; font-size:.95rem; }
+    .mini pre { margin:0; font-family:Consolas, monospace; white-space:pre-wrap; color:var(--muted); }
+    .right { display:grid; grid-template-rows:auto auto auto 1fr auto; gap:12px; padding:16px; }
+    .card { background:rgba(255,255,255,.62); border:1px solid rgba(0,0,0,.08); border-radius:14px; padding:14px; }
+    .card h2 { margin:0 0 10px; font-size:1.05rem; }
+    .metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+    .metric { background:rgba(255,250,240,.8); border-radius:10px; padding:10px; border:1px solid rgba(0,0,0,.06); }
+    .metric .label { display:block; font-size:.78rem; text-transform:uppercase; color:var(--muted); margin-bottom:4px; }
+    .metric .value { font-weight:700; }
+    .mono { font-family:Consolas, monospace; font-size:.88rem; background:rgba(31,41,51,.04); border-radius:10px; padding:10px; max-height:220px; overflow:auto; white-space:pre-wrap; }
+    @media (max-width: 1180px) { .app { grid-template-columns:1fr; } .overlay { position:static; grid-template-columns:1fr; padding-top:12px; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <section class="panel left">
+      <div class="hero">
+        <h1>Dual Mode QML Rover Demo</h1>
+        <p id="meta">Loading...</p>
+      </div>
+      <div class="toolbar">
+        <div class="tabs">
+          <button class="tab active" data-mode="mapping">Full Mapping</button>
+          <button class="tab" data-mode="path">Point A to B</button>
+        </div>
+        <label>Case
+          <select id="caseSelect"></select>
+        </label>
+        <label>Seed
+          <input id="seedInput" type="number" value="11" style="width:88px;" />
+        </label>
+        <button class="action" id="runBtn">Run Mode</button>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="mapCanvas" width="980" height="680"></canvas>
+        <div class="overlay">
+          <div class="mini"><h3>QML</h3><pre id="qmlBox">-</pre></div>
+          <div class="mini"><h3>Robot State</h3><pre id="poseBox">-</pre></div>
+          <div class="mini"><h3>Coordinates</h3><pre id="coordBox">-</pre></div>
+        </div>
+      </div>
+    </section>
+    <aside class="panel right">
+      <section class="card"><h2>Scenario</h2><div id="scenarioBox">-</div></section>
+      <section class="card"><h2>Stats</h2><div id="statsBox" class="metrics"></div></section>
+      <section class="card"><h2>Hazards</h2><div id="hazBox" class="mono">-</div></section>
+      <section class="card"><h2>Significant Points</h2><div id="sigBox" class="mono">-</div></section>
+      <section class="card"><h2>Debug / Timeline</h2><div id="debugBox" class="mono">-</div></section>
+    </aside>
+  </div>
+  <script>
+    const caseCount = Number('{{ case_count }}');
+    const state = { mode:'mapping', data:null, poseIndex:0, timer:null, requestId:0, animToken:0 };
+    const tabs = [...document.querySelectorAll('.tab')];
+    const els = {
+      meta: document.getElementById('meta'),
+      caseSelect: document.getElementById('caseSelect'),
+      seedInput: document.getElementById('seedInput'),
+      runBtn: document.getElementById('runBtn'),
+      canvas: document.getElementById('mapCanvas'),
+      qmlBox: document.getElementById('qmlBox'),
+      poseBox: document.getElementById('poseBox'),
+      coordBox: document.getElementById('coordBox'),
+      scenarioBox: document.getElementById('scenarioBox'),
+      statsBox: document.getElementById('statsBox'),
+      hazBox: document.getElementById('hazBox'),
+      sigBox: document.getElementById('sigBox'),
+      debugBox: document.getElementById('debugBox'),
+    };
+    const ctx = els.canvas.getContext('2d');
+    for (let i=0;i<caseCount;i++) {
+      const opt = document.createElement('option'); opt.value = String(i); opt.textContent = `Case ${i+1}`; els.caseSelect.appendChild(opt);
+    }
+
+    function setBusy(busy) {
+      els.runBtn.disabled = busy;
+      tabs.forEach(t => t.disabled = busy);
+      els.caseSelect.disabled = busy;
+      els.seedInput.disabled = busy;
+    }
+
+    function visibleDetections(data, poseIndex) {
+      const traversed = (data.path || []).slice(0, Math.min(poseIndex + 1, (data.path || []).length));
+      const seen = new Map();
+      for (const point of (data.detected_points || [])) {
+        const near = point.flagged || point.blocked
+          ? traversed.some(p => Math.abs(p.x - point.x) + Math.abs(p.y - point.y) <= 1)
+          : traversed.some(p => p.x === point.x && p.y === point.y);
+        if (near) seen.set(`${point.x},${point.y}`, point);
+      }
+      return [...seen.values()];
+    }
+
+    function traversedCells(data, poseIndex) {
+      const traversed = (data.path || []).slice(0, Math.min(poseIndex + 1, (data.path || []).length));
+      const seen = new Map();
+      for (const cell of traversed) seen.set(`${cell.x},${cell.y}`, cell);
+      return [...seen.values()];
+    }
+
+    function draw(data, poseIndex) {
+      const w = data.width, h = data.height;
+      const margin = 48;
+      const size = Math.min((els.canvas.width - margin*2)/w, (els.canvas.height - margin*2)/h);
+      function toCanvas(x,y){ return {x:margin + x*size + size/2, y:margin + (h-1-y)*size + size/2}; }
+      ctx.clearRect(0,0,els.canvas.width,els.canvas.height);
+      ctx.fillStyle = '#fdfaf4'; ctx.fillRect(0,0,els.canvas.width,els.canvas.height);
+      ctx.strokeStyle = 'rgba(0,0,0,.14)';
+      for(let gx=0; gx<=w; gx++){ const x=margin+gx*size; ctx.beginPath(); ctx.moveTo(x,margin); ctx.lineTo(x,margin+h*size); ctx.stroke(); }
+      for(let gy=0; gy<=h; gy++){ const y=margin+gy*size; ctx.beginPath(); ctx.moveTo(margin,y); ctx.lineTo(margin+w*size,y); ctx.stroke(); }
+      for (const cell of traversedCells(data, poseIndex)) {
+        const p = toCanvas(cell.x, cell.y); ctx.fillStyle='rgba(59,130,246,.12)'; ctx.fillRect(p.x-size/2+1,p.y-size/2+1,size-2,size-2);
+      }
+      for (const point of visibleDetections(data, poseIndex)) {
+        const p = toCanvas(point.x, point.y);
+        ctx.beginPath();
+        ctx.fillStyle = point.flagged ? '#c81e1e' : point.blocked ? '#111827' : '#64748b';
+        ctx.arc(p.x,p.y, point.flagged ? size*0.24 : point.blocked ? size*0.22 : size*0.18, 0, Math.PI*2); ctx.fill();
+      }
+      const s = toCanvas(data.start.x, data.start.y); ctx.fillStyle='#15803d'; ctx.beginPath(); ctx.arc(s.x,s.y,size*0.22,0,Math.PI*2); ctx.fill();
+      if (data.goal) {
+        const g = toCanvas(data.goal.x,data.goal.y);
+        ctx.beginPath(); ctx.arc(g.x,g.y,size*0.24,0,Math.PI*2); ctx.strokeStyle='#b45309'; ctx.lineWidth=Math.max(3,size*0.12); ctx.stroke();
+      }
+      const path = data.path || [];
+      if (path.length > 1) {
+        ctx.lineWidth = Math.max(3, size*0.18);
+        for (let i=1;i<Math.min(path.length, poseIndex+1);i++) {
+          const a = toCanvas(path[i-1].x, path[i-1].y); const b = toCanvas(path[i].x, path[i].y);
+          ctx.strokeStyle = '#0284c7'; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+        }
+      }
+      const pose = path[Math.min(poseIndex, Math.max(0,path.length-1))] || data.start;
+      const pos = toCanvas(pose.x, pose.y);
+      ctx.save(); ctx.translate(pos.x,pos.y); ctx.fillStyle='#2563eb'; ctx.fillRect(-size*0.26,-size*0.18,size*0.52,size*0.36); ctx.restore();
+    }
+
+    function renderData(data) {
+      state.data = data;
+      state.poseIndex = 0;
+      state.animToken += 1;
+      const token = state.animToken;
+      if (state.timer) clearInterval(state.timer);
+      els.meta.textContent = `${data.title} | case=${data.case_index + 1} | mode=${data.mode} | real QML backend via PennyLane`;
+      els.qmlBox.textContent = `${data.qml.framework}\n${data.qml.device}\n${data.qml.circuit}\nqubits=${data.qml.qubits} layers=${data.qml.layers}\n${data.qml.note}`;
+      els.scenarioBox.innerHTML = `<div><strong>${data.title}</strong></div><div>start=(${data.start.x}, ${data.start.y})${data.goal ? ` | goal=(${data.goal.x}, ${data.goal.y})` : ''}</div><div>grid=${data.width}x${data.height}</div><div>robot knowledge=${data.goal ? 'goal-only plus live local sensing' : 'live local sensing only'}</div>`;
+      els.statsBox.innerHTML = [
+        ['Steps', data.stats.steps], ['Coverage', `${(data.stats.coverage_rate*100).toFixed(1)}%`], ['Goal', data.goal ? (data.stats.goal_reached ? 'Reached' : 'Not yet') : 'N/A'],
+        ['Hazards', data.stats.hazard_count], ['Blocked', data.stats.blocked_count], ['Safe', data.stats.safe_count],
+        ['Detected', (data.detected_points || []).length]
+      ].map(([k,v]) => `<div class="metric"><span class="label">${k}</span><span class="value">${v}</span></div>`).join('');
+      els.hazBox.textContent = 'No hazards logged yet.';
+      els.sigBox.textContent = 'No significant points detected yet.';
+      els.debugBox.textContent = 'live run in progress...';
+      draw(data, 0);
+      state.timer = setInterval(() => {
+        if (!state.data || token !== state.animToken) { clearInterval(state.timer); return; }
+        state.poseIndex += 1;
+        if (state.poseIndex >= state.data.path.length) { clearInterval(state.timer); setBusy(false); }
+        const pose = state.data.path[Math.min(state.poseIndex, Math.max(0, state.data.path.length - 1))] || state.data.start;
+        els.poseBox.textContent = `pose=(${pose.x}, ${pose.y})\nstep=${Math.min(state.poseIndex, Math.max(0, state.data.path.length - 1))}/${Math.max(0, state.data.path.length - 1)}`;
+        const visible = visibleDetections(state.data, state.poseIndex);
+        const hazardsSeen = visible.filter(p => p.flagged);
+        const blockedSeen = visible.filter(p => p.blocked);
+        const safeSeen = visible.filter(p => !p.flagged && !p.blocked);
+        const timelineStep = Math.min(state.poseIndex + 1, state.data.timeline.length);
+        const debugStep = Math.min(state.poseIndex + 1, state.data.debug.length);
+        els.coordBox.textContent = [
+          `current=(${pose.x}, ${pose.y})`,
+          ...(state.data.goal ? [`goal=(${state.data.goal.x}, ${state.data.goal.y})`] : []),
+          ...hazardsSeen.map(h => `(${h.x}, ${h.y}) - hazardous obstruction`),
+          ...blockedSeen.map(b => `(${b.x}, ${b.y}) - blocked obstruction`),
+          ...safeSeen.map(s => `(${s.x}, ${s.y}) - nonhazardous obstruction`)
+        ].join('\n');
+        els.hazBox.textContent = hazardsSeen.length
+          ? hazardsSeen.map(h => `(${h.x}, ${h.y}) - hazardous obstruction`).join('\n')
+          : 'No hazards logged yet.';
+        els.sigBox.textContent = visible.length
+          ? visible.map(p => `(${p.x}, ${p.y}) - ${p.label}`).join('\n')
+          : 'No significant points detected yet.';
+        els.debugBox.textContent = [
+          ...state.data.timeline.slice(0, timelineStep),
+          ...(debugStep ? ['---'] : []),
+          ...state.data.debug.slice(0, debugStep),
+        ].join('\n') || 'live run in progress...';
+        draw(state.data, state.poseIndex);
+      }, 90);
+    }
+
+    async function run() {
+      const reqId = ++state.requestId;
+      state.animToken += 1;
+      if (state.timer) clearInterval(state.timer);
+      setBusy(true);
+      els.meta.textContent = 'Running...';
+      els.debugBox.textContent = 'requesting backend...';
+      const seed = Number(els.seedInput.value || '11');
+      const caseIdx = Number(els.caseSelect.value || '0');
+      try {
+        const res = await fetch(`/api/run?mode=${state.mode}&seed=${seed}&case=${caseIdx}`);
+        const data = await res.json();
+        if (reqId !== state.requestId) return;
+        if (!res.ok || data.error) {
+          throw new Error(data.error || `request failed with ${res.status}`);
+        }
+        renderData(data);
+      } catch (err) {
+        if (reqId !== state.requestId) return;
+        els.meta.textContent = 'Run failed';
+        els.debugBox.textContent = String(err);
+        setBusy(false);
+      }
+    }
+
+    tabs.forEach(tab => tab.addEventListener('click', () => {
+      if (tab.disabled) return;
+      tabs.forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      state.mode = tab.dataset.mode;
+      run();
+    }));
+    els.runBtn.addEventListener('click', run);
+    window.addEventListener('load', run);
+  </script>
+</body>
+</html>
