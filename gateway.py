@@ -11,6 +11,7 @@ from collections import deque
 from typing import Any, Optional
 
 import httpx
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -125,6 +126,31 @@ class GatewayState:
             return list(self.terac_history)[:limit]
 
 
+
+class HttpJpegCapture:
+    def __init__(self, url: str):
+        self.url = url
+        self._opened = True
+
+    def isOpened(self):
+        return self._opened
+
+    def read(self):
+        if not self._opened:
+            return False, None
+        try:
+            response = httpx.get(self.url, timeout=2.0)
+            response.raise_for_status()
+            buf = np.frombuffer(response.content, dtype=np.uint8)
+            frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            if frame is None:
+                return False, None
+            return True, frame
+        except Exception:
+            return False, None
+
+    def release(self):
+        self._opened = False
 # ── CV Pipeline Adapter ─────────────────────────────────────
 
 
@@ -151,11 +177,19 @@ class CVPipelineAdapter:
             self.cv_module = importlib.import_module("cv_server")
             self.state.cv_status = "connected"
             self.state.cv_error = None
+            return
         except Exception as exc:
-            self.cv_module = None
             self.import_error = str(exc)
+
+        # Keep gateway alive with a lightweight fallback if full cv_server fails to load.
+        try:
+            self.cv_module = importlib.import_module("cv_server_fallback")
             self.state.cv_status = "degraded"
-            self.state.cv_error = self.import_error
+            self.state.cv_error = f"cv_server unavailable ({self.import_error}); using fallback"
+        except Exception as fallback_exc:
+            self.cv_module = None
+            self.state.cv_status = "degraded"
+            self.state.cv_error = f"cv_server import failed: {self.import_error}; fallback failed: {fallback_exc}"
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -221,6 +255,11 @@ class CVPipelineAdapter:
                 elif "/mjpegfeed" in low:
                     candidates.append(src.replace("/mjpegfeed", "/video"))
                     candidates.append(src.replace("/mjpegfeed", "/shot.jpg"))
+                elif not low.endswith("/shot.jpg"):
+                    candidates.append(src.rstrip("/") + "/shot.jpg")
+
+                # Fallback to local camera indexes if network stream URL is stale.
+                candidates.extend(["0", "1"])
 
         dedup = []
         for c in candidates:
@@ -238,7 +277,8 @@ class CVPipelineAdapter:
             if backend is not None:
                 backends.append(backend)
 
-        for source in self._candidate_capture_sources():
+        sources = self._candidate_capture_sources()
+        for source in sources:
             open_arg = int(source) if isinstance(source, str) and source.isdigit() else source
             for backend in backends:
                 try:
@@ -250,8 +290,25 @@ class CVPipelineAdapter:
                 if cap is not None:
                     cap.release()
 
-        return None, None
+        # Fallback for DroidCam HTTP endpoints when OpenCV backend cannot open stream directly.
+        for source in sources:
+            if not isinstance(source, str):
+                continue
+            low = source.lower().strip()
+            if not low.startswith("http"):
+                continue
+            shot_url = source
+            if "/video" in low:
+                shot_url = source.replace("/video", "/shot.jpg")
+            elif "/mjpegfeed" in low:
+                shot_url = source.replace("/mjpegfeed", "/shot.jpg")
+            cap = HttpJpegCapture(shot_url)
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap, shot_url
+            cap.release()
 
+        return None, None
     def _run_loop(self):
         if cv2 is None:
             self.state.camera_status = "disconnected"
@@ -517,5 +574,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 
 

@@ -3,14 +3,18 @@ import { Card } from '../ui/Card';
 import { useRover } from '../../context/RoverContext';
 
 export function LiveFeedPanel() {
-  const { droidCamStreamUrl } = useRover();
+  const { droidCamStreamUrl, feedData } = useRover();
+  const cvFrame = feedData?.image_jpeg_base64
+    ? `data:image/jpeg;base64,${feedData.image_jpeg_base64}`
+    : null;
+  const streamSrc = cvFrame || droidCamStreamUrl;
 
   return (
     <Card style={{ flex: 1, padding: 0, overflow: 'hidden' }}>
-      {droidCamStreamUrl ? (
+      {streamSrc ? (
         <img
-          src={droidCamStreamUrl}
-          alt="DroidCam live feed"
+          src={streamSrc}
+          alt={cvFrame ? 'CV pipeline frame' : 'DroidCam live feed'}
           style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', background: '#000' }}
         />
       ) : (

@@ -8,10 +8,7 @@ import { useRover } from './context/RoverContext';
 
 function App() {
   const { systemStatus, feedStatus } = useRover();
-  const rawCameraStatus = systemStatus?.camera?.status || 'disconnected';
-  const cameraUiStatus = (rawCameraStatus === 'connected' || Boolean(systemStatus?.droidcam_stream_url))
-    ? 'connected'
-    : rawCameraStatus;
+  const cameraUiStatus = systemStatus?.camera?.status || 'disconnected';
 
   return (
     <div style={{ padding: 'var(--space-4)', maxWidth: '1600px', margin: '0 auto', height: '100vh', display: 'flex', flexDirection: 'column' }}>
