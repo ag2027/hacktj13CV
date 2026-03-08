@@ -208,6 +208,50 @@ class CVPipelineAdapter:
             "pipeline_time_s": 0.0,
         }
 
+    def _candidate_capture_sources(self):
+        primary = self.source
+        candidates = [primary]
+        if isinstance(primary, str):
+            src = primary.strip()
+            low = src.lower()
+            if low.startswith("http"):
+                if "/video" in low:
+                    candidates.append(src.replace("/video", "/mjpegfeed"))
+                    candidates.append(src.replace("/video", "/shot.jpg"))
+                elif "/mjpegfeed" in low:
+                    candidates.append(src.replace("/mjpegfeed", "/video"))
+                    candidates.append(src.replace("/mjpegfeed", "/shot.jpg"))
+
+        dedup = []
+        for c in candidates:
+            if c not in dedup:
+                dedup.append(c)
+        return dedup
+
+    def _open_capture(self):
+        if cv2 is None:
+            return None, None
+
+        backends = [None]
+        for name in ("CAP_FFMPEG", "CAP_MSMF", "CAP_DSHOW"):
+            backend = getattr(cv2, name, None)
+            if backend is not None:
+                backends.append(backend)
+
+        for source in self._candidate_capture_sources():
+            open_arg = int(source) if isinstance(source, str) and source.isdigit() else source
+            for backend in backends:
+                try:
+                    cap = cv2.VideoCapture(open_arg) if backend is None else cv2.VideoCapture(open_arg, backend)
+                except Exception:
+                    cap = None
+                if cap is not None and cap.isOpened():
+                    return cap, str(source)
+                if cap is not None:
+                    cap.release()
+
+        return None, None
+
     def _run_loop(self):
         if cv2 is None:
             self.state.camera_status = "disconnected"
@@ -218,25 +262,34 @@ class CVPipelineAdapter:
             self.state.camera_error = "No camera source configured"
             return
 
-        capture_source = int(self.source) if str(self.source).isdigit() else self.source
-        cap = cv2.VideoCapture(capture_source)
-        if not cap.isOpened():
-            self.state.camera_status = "disconnected"
-            self.state.camera_error = f"Could not open camera source: {self.source}"
-            return
-
-        self.state.camera_status = "connected"
-        self.state.camera_error = None
+        cap = None
+        active_source = str(self.source)
         raw_index = 0
         frames_processed = 0
 
         try:
             while not self.stop_event.is_set():
+                if cap is None or not cap.isOpened():
+                    if cap is not None:
+                        cap.release()
+                    cap, opened_source = self._open_capture()
+                    if cap is None:
+                        self.state.camera_status = "disconnected"
+                        self.state.camera_error = f"Could not open camera source: {self.source}"
+                        time.sleep(1.0)
+                        continue
+                    active_source = opened_source
+                    self.state.camera_source = active_source
+                    self.state.camera_status = "connected"
+                    self.state.camera_error = None
+
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     self.state.camera_status = "degraded"
-                    self.state.camera_error = "Frame read failed"
-                    time.sleep(0.2)
+                    self.state.camera_error = f"Frame read failed ({active_source})"
+                    cap.release()
+                    cap = None
+                    time.sleep(0.25)
                     continue
 
                 raw_index += 1
@@ -285,9 +338,9 @@ class CVPipelineAdapter:
                     frames_processed=frames_processed,
                 )
         finally:
-            cap.release()
+            if cap is not None:
+                cap.release()
             self.state.camera_status = "disconnected"
-
 
 # ── FastAPI App ──────────────────────────────────────────────
 
@@ -464,4 +517,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
