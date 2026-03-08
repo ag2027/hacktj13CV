@@ -8,8 +8,11 @@ export function LiveFeedPanel() {
   const [showOverlay, setShowOverlay] = useState(true);
   const canvasRef = useRef(null);
   const { feedData, feedStatus, droidCamStreamUrl } = useRover();
+  const useDroidCamPrimary = Boolean(droidCamStreamUrl);
 
   useEffect(() => {
+    if (useDroidCamPrimary) return;
+
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -31,7 +34,7 @@ export function LiveFeedPanel() {
         ctx.drawImage(img, x, y, w, h);
 
         if (showOverlay && feedData.detections) {
-          // Overlay hooks can be rendered here if needed.
+          // Optional overlay rendering hook.
         }
       };
       img.src = `data:image/jpeg;base64,${feedData.image_jpeg_base64}`;
@@ -50,7 +53,7 @@ export function LiveFeedPanel() {
       ctx.textAlign = 'center';
       ctx.fillText('Awaiting video stream...', canvas.width / 2, canvas.height / 2);
     }
-  }, [feedData, showOverlay]);
+  }, [feedData, showOverlay, useDroidCamPrimary]);
 
   return (
     <Card style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
@@ -62,9 +65,12 @@ export function LiveFeedPanel() {
           ) : (
             <Badge variant="critical">OFFLINE</Badge>
           )}
+          <Badge variant={useDroidCamPrimary ? 'safe' : 'secondary'}>
+            {useDroidCamPrimary ? 'DROIDCAM' : 'PIPELINE'}
+          </Badge>
         </div>
         <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
-          <Button onClick={() => setShowOverlay(!showOverlay)} variant="secondary">
+          <Button onClick={() => setShowOverlay(!showOverlay)} variant="secondary" disabled={useDroidCamPrimary}>
             {showOverlay ? 'Hide Overlay' : 'Show Overlay'}
           </Button>
         </div>
@@ -81,40 +87,25 @@ export function LiveFeedPanel() {
         justifyContent: 'center',
         border: '1px solid rgba(255,255,255,0.1)'
       }}>
-        <canvas
-          ref={canvasRef}
-          width={800}
-          height={600}
-          style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-        />
-      </div>
-
-      <div style={{
-        background: 'rgba(255,255,255,0.02)',
-        border: '1px solid rgba(255,255,255,0.1)',
-        borderRadius: '8px',
-        padding: 'var(--space-2)'
-      }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'var(--space-2)' }}>
-          <span style={{ color: 'var(--text-primary)', fontWeight: 600, fontSize: '0.92rem' }}>DroidCam Live Stream</span>
-          <Badge variant={droidCamStreamUrl ? 'safe' : 'warning'}>{droidCamStreamUrl ? 'Configured' : 'Not Set'}</Badge>
-        </div>
-        {droidCamStreamUrl ? (
+        {useDroidCamPrimary ? (
           <img
             src={droidCamStreamUrl}
-            alt="DroidCam stream"
-            style={{ width: '100%', maxHeight: '220px', objectFit: 'contain', borderRadius: '6px', background: '#000' }}
+            alt="DroidCam live feed"
+            style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
           />
         ) : (
-          <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-            Set `DROIDCAM_STREAM_URL` (gateway) or `VITE_DROIDCAM_STREAM_URL` (frontend) to display DroidCam directly.
-          </div>
+          <canvas
+            ref={canvasRef}
+            width={800}
+            height={600}
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+          />
         )}
       </div>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
         <span>Frame latency: {feedData?.pipeline_time_s ? (feedData.pipeline_time_s * 1000).toFixed(0) : '0'}ms</span>
-        <span>Resolution: 800x600</span>
+        <span>{useDroidCamPrimary ? 'Source: DroidCam URL' : 'Source: Gateway pipeline'}</span>
       </div>
     </Card>
   );

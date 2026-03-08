@@ -4,7 +4,7 @@ import { Badge } from '../ui/Badge';
 import { useRover } from '../../context/RoverContext';
 
 export function ThreatFeedPanel() {
-  const { feedData, anomalyPoints } = useRover();
+  const { feedData, anomalyPoints, ultrasonicAnomalies } = useRover();
   const [threats, setThreats] = useState([]);
   const [filter, setFilter] = useState('all');
 
@@ -19,15 +19,39 @@ export function ThreatFeedPanel() {
             type: t.label || t.threat_type || t.type || 'Unknown Threat',
             severity: (t.danger_score || 0) > 0.8 ? 'critical' : 'warning',
             time: new Date().toLocaleTimeString(),
-            score: (t.danger_score || t.confidence || 0).toFixed(2)
+            score: (t.danger_score || t.confidence || 0).toFixed(2),
+            source: 'cv'
           }));
 
           const combined = [...added, ...prev];
-          return combined.slice(0, 50);
+          return combined.slice(0, 80);
         });
       }
     }
   }, [feedData]);
+
+  useEffect(() => {
+    if (!ultrasonicAnomalies?.length) return;
+
+    const latest = ultrasonicAnomalies[0];
+    setThreats(prev => {
+      if (prev[0]?.id === latest.id) return prev;
+
+      const ultraThreat = {
+        id: latest.id,
+        type: 'Ultrasonic Obstacle',
+        severity: latest.severity,
+        time: latest.timeText,
+        score: latest.score.toFixed(2),
+        source: 'ultrasonic',
+        detail: latest.distanceCm != null
+          ? `distance=${latest.distanceCm}cm threshold=${latest.thresholdCm}cm`
+          : 'distance=unknown'
+      };
+
+      return [ultraThreat, ...prev].slice(0, 80);
+    });
+  }, [ultrasonicAnomalies]);
 
   const filteredThreats = threats.filter(t => {
     if (filter === 'all') return true;
@@ -35,7 +59,7 @@ export function ThreatFeedPanel() {
   });
 
   return (
-    <Card style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)', height: '520px' }}>
+    <Card style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)', height: '540px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h2 style={{ margin: 0 }}>Threat Log</h2>
         <Badge variant="critical">{threats.filter(t => t.severity === 'critical').length} alerts</Badge>
@@ -70,7 +94,7 @@ export function ThreatFeedPanel() {
         flexDirection: 'column',
         gap: 'var(--space-2)',
         marginTop: 'var(--space-2)',
-        maxHeight: '220px',
+        maxHeight: '240px',
         overflowY: 'auto'
       }}>
         {filteredThreats.length === 0 ? (
@@ -93,10 +117,13 @@ export function ThreatFeedPanel() {
                 <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{threat.time}</span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Score: {threat.score}</span>
-                <Badge variant={threat.severity}>
-                  {threat.severity.toUpperCase()}
-                </Badge>
+                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                  Score: {threat.score} {threat.detail ? `| ${threat.detail}` : ''}
+                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-1)' }}>
+                  <Badge variant="secondary">{threat.source === 'ultrasonic' ? 'ULTRA' : 'CV'}</Badge>
+                  <Badge variant={threat.severity}>{threat.severity.toUpperCase()}</Badge>
+                </div>
               </div>
             </div>
           ))
