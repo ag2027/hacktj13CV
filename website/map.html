@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SENTINEL — Tactical Map</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="container">
+      <h1 class="brand">SENTINEL</h1>
+      <nav class="main-nav">
+        <a href="index.html">Home</a>
+        <a href="livefeed.html">Live Feed</a>
+        <a href="map.html">Tactical Map</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <h2>Tactical Map</h2>
+    <p>Interactive map with pinned detections. This page contains placeholders for integration with mapping libraries (Mapbox/Leaflet).</p>
+
+    <div class="card" style="padding:0;margin-top:12px">
+      <div id="map" style="height:480px;background:linear-gradient(135deg,#e6f2ff,#f6f9ff);display:flex;align-items:center;justify-content:center;color:#6b7280">Map placeholder — integrate Leaflet or Mapbox here</div>
+    </div>
+
+    <section style="margin-top:18px">
+      <h3>Pinned Detections</h3>
+      <ul id="pins-list"></ul>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container"><small>&copy; SENTINEL Project</small></div>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

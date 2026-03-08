@@ -1,0 +1,33 @@
+:root {
+  /* Tactical Palette */
+  --bg-gradient-start: #071020;
+  --bg-gradient-end: #0f1724;
+  --card-bg: #0b1220;
+  --card-border: rgba(255, 255, 255, 0.06);
+  --accent: #0b6efd;
+  
+  /* Status Colors */
+  --critical: #ef4444;
+  --warning: #f59e0b;
+  --safe: #22c55e;
+  
+  /* Text */
+  --text-primary: #e6eef8;
+  --text-muted: #9aa4b2;
+  
+  /* Typography */
+  --font-sans: 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+
+  /* Spacing & Layout */
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --radius-card: 10px;
+  --radius-badge: 6px;
+  
+  /* Z-index */
+  --z-overlay: 100;
+  --z-topbar: 200;
+}
