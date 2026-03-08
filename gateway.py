@@ -33,6 +33,7 @@ class GatewayState:
         self.camera_error = None
         self.cv_error = None
         self.droidcam_stream_url = None
+        self.camera_source = None
         self.latest_feed = {
             "type": "feed",
             "seq": 0,
@@ -88,6 +89,7 @@ class GatewayState:
                 "cv": {"status": self.cv_status, "error": self.cv_error},
                 "qml": {"status": self.qml_status},
                 "droidcam_stream_url": self.droidcam_stream_url,
+                "camera_source": self.camera_source,
                 "feed_seq": self.latest_feed["seq"],
                 "cv_stats": dict(self.cv_stats),
             }
@@ -290,11 +292,24 @@ class CVPipelineAdapter:
 # ── FastAPI App ──────────────────────────────────────────────
 
 
+def resolve_camera_source(camera_source: Optional[str], droidcam_stream_url: str) -> str:
+    raw_source = "" if camera_source is None else str(camera_source).strip()
+    if raw_source.lower() in ("", "auto", "none"):
+        return droidcam_stream_url if droidcam_stream_url else "0"
+    if raw_source == "0" and droidcam_stream_url:
+        # If DroidCam URL is configured, prefer it over default webcam index 0.
+        return droidcam_stream_url
+    return raw_source
+
+
 def build_app(args):
     state = GatewayState()
+    droidcam_stream_url = (args.droidcam_stream_url or "").strip()
+    camera_source = resolve_camera_source(args.camera_source, droidcam_stream_url)
+
     cv_adapter = CVPipelineAdapter(
         state=state,
-        source=args.camera_source,
+        source=camera_source,
         process_every_n=args.process_every_n,
         jpeg_quality=args.jpeg_quality,
     )
@@ -310,7 +325,8 @@ def build_app(args):
     app.state.gateway = state
     app.state.cv_adapter = cv_adapter
     app.state.qml_base_url = args.qml_base_url.rstrip("/")
-    state.droidcam_stream_url = args.droidcam_stream_url
+    state.droidcam_stream_url = droidcam_stream_url
+    state.camera_source = camera_source
 
     @app.on_event("startup")
     async def on_startup():
@@ -432,7 +448,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="SENTINEL FastAPI gateway")
     parser.add_argument("--host", default=os.environ.get("GATEWAY_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("GATEWAY_PORT", "8090")))
-    parser.add_argument("--camera-source", default=os.environ.get("DROIDCAM_SOURCE", "0"))
+    parser.add_argument("--camera-source", default=os.environ.get("DROIDCAM_SOURCE", "auto"))
     parser.add_argument("--process-every-n", type=int, default=int(os.environ.get("DROIDCAM_PROCESS_EVERY_N", "6")))
     parser.add_argument("--jpeg-quality", type=int, default=int(os.environ.get("GATEWAY_JPEG_QUALITY", "80")))
     parser.add_argument("--qml-base-url", default=os.environ.get("QML_BASE_URL", "http://127.0.0.1:8000"))
