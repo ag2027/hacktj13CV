@@ -3,11 +3,11 @@
 # Military & Rescue Autonomous Reconnaissance Rover
 # ============================================================
 # CHANGES FROM v5:
-#   [R1] SceneChangeDetector — gates Gemini calls on real delta
+#   [R1] SceneChangeDetector — gates Groq calls on real delta
 #   [R2] ObjectTracker — IoU dedup + grid-cell memory
-#   [R3] Stripped enrichment — only what Gemini can't see itself
+#   [R3] Stripped enrichment — only what Groq can't see itself
 #   [R4] Raised confidence thresholds (CONF_OBJECT 0.30→0.40)
-#   [R5] Waypoint-aligned Gemini — fires on checkpoint transitions
+#   [R5] Waypoint-aligned Groq — fires on checkpoint transitions
 #   [R6] Compressed prompt — ~60% shorter, same assessment quality
 # ============================================================
 
@@ -20,7 +20,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from google.colab import files
 import numpy as np
-from google import genai
+from groq import Groq
+import base64
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -32,26 +33,27 @@ from PIL import Image
 print("✅ All imports successful.")
 
 # ── CELL 3: Configuration ────────────────────────────────────
-GEMINI_API_KEY   = "AIzaSyDp-gxA_e0IkTU9ILQz2k5n1LVv-lexRnY"
-# Model options (google.genai SDK + AI Studio API key):
-#   "gemini-2.0-flash-lite"   — fastest, free tier, multimodal ✓  ← recommended
-#   "gemini-2.0-flash"        — smarter, free tier, multimodal ✓
-#   "gemini-1.5-flash-8b"     — fallback if 2.0 quota exhausted
-# NOTE: "gemma-3-12b-it" is a HuggingFace ID — NOT valid for this SDK.
-#       Gemma on AI Studio requires Vertex AI client, not google.genai.
-GEMINI_MODEL     = "gemini-3.1-flash-lite-preview"
+import os
+from dotenv import load_dotenv
+load_dotenv()  # loads GROQ_API_KEY from a .env file if present (never committed)
 
-# Model capability flag — set automatically from model name.
-# Gemma models on this API are text-only (no image input).
-# Gemini models are multimodal.
-# This controls whether the image is included in the API call.
-MODEL_IS_MULTIMODAL = not GEMINI_MODEL.startswith("models/gemma") and "gemma" not in GEMINI_MODEL
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
+# Model options (groq SDK + console.groq.com API key):
+#   "meta-llama/llama-4-scout-17b-16e-instruct" — latest multimodal ✓  ← recommended
+#   "llama-3.2-90b-vision-preview"  — smarter, multimodal ✓
+#   "llama-3.2-11b-vision-preview"  — fast, multimodal ✓
+# NOTE: All Groq vision models are multimodal (image + text input supported).
+# To set your key: copy .env.example → .env and fill in GROQ_API_KEY=gsk_...
+GROQ_MODEL       = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# All Groq vision models support image input.
+MODEL_IS_MULTIMODAL = True
 
 # Request timeout — prevents indefinite hang on bad model strings or network issues.
-GEMINI_REQUEST_TIMEOUT = 45
+GROQ_REQUEST_TIMEOUT = 45
 
 DANGER_THRESHOLD       = 5
-GEMINI_MIN_INTERVAL    = 3.0   # wall-clock seconds — kept as backstop
+GROQ_MIN_INTERVAL    = 3.0   # wall-clock seconds — kept as backstop
 
 # [R4] Raised thresholds — reduces garbage candidates
 CONF_PERSON            = 0.40
@@ -66,20 +68,20 @@ YOLO_IMGSZ             = 640
 # [R1] Scene-change gating parameters
 SCENE_DELTA_NEW_CLASS_WEIGHT  = 1.0  # full point for a brand-new class appearing
 SCENE_DELTA_BBOX_MOVE_THRESH  = 0.15 # fraction of frame width = significant move
-# [FIX 1] Raised 1.0 → 2.5 — requires multiple meaningful changes before Gemini fires.
+# [FIX 1] Raised 1.0 → 2.5 — requires multiple meaningful changes before Groq fires.
 # Scoring: new class=+1.0, class gone=+0.5, significant move=+0.5, special candidate=+0.8
 # Examples: 3 new classes=3.0 ✓ | 2 new + fire=2.8 ✓ | 1 new + fire=1.8 ✗
 SCENE_DELTA_MIN_TRIGGER       = 2.5
 
-# [FIX 2] NEW — minimum processed frames between any two Gemini calls.
+# [FIX 2] NEW — minimum processed frames between any two Groq calls.
 # Frame-count based, not time-based — actually limits calls during video processing.
 # At FRAME_SKIP=3 on 30fps: 8 processed frames ≈ 0.8s of real footage between calls.
-GEMINI_MIN_FRAMES_BETWEEN     = 8
+GROQ_MIN_FRAMES_BETWEEN     = 8
 
-# [FIX 3] NEW — hard cap on total Gemini calls per session.
+# [FIX 3] NEW — hard cap on total Groq calls per session.
 # Free tier: 1,500/day. 40 calls is conservative, leaves room for multiple runs.
 # Set to 0 to disable.
-GEMINI_SESSION_CAP            = 40
+GROQ_SESSION_CAP            = 40
 
 # [R2] Object tracker parameters
 IOU_DEDUP_THRESHOLD    = 0.50  # merge same-class boxes with IoU > this
@@ -89,24 +91,27 @@ TRACKER_TTL_FRAMES     = 20    # known objects expire after this many frames
 
 # Debug flags
 DEBUG_CANDIDATES       = True
-DEBUG_GEMINI_PROMPT    = False
-DEBUG_GEMINI_RAW       = True
+DEBUG_GROQ_PROMPT    = False
+DEBUG_GROQ_RAW       = True
 DEBUG_STAGE_TIMINGS    = True
-DEBUG_SCENE_DELTA      = True  # [R1] show what triggered (or suppressed) Gemini
+DEBUG_SCENE_DELTA      = True  # [R1] show what triggered (or suppressed) Groq
 
 print("✅ Config set.")
-print(f"   Model: {GEMINI_MODEL} | multimodal={'YES' if MODEL_IS_MULTIMODAL else 'NO — text-only (Gemma)'}")
-print(f"   Gemini gates: scene_delta>={SCENE_DELTA_MIN_TRIGGER} "
-      f"AND {GEMINI_MIN_FRAMES_BETWEEN}+ frames since last call "
-      f"AND {GEMINI_MIN_INTERVAL}s wall-clock")
-print(f"   Session cap: {GEMINI_SESSION_CAP if GEMINI_SESSION_CAP else 'disabled'} calls")
+print(f"   Model: {GROQ_MODEL} | multimodal={'YES' if MODEL_IS_MULTIMODAL else 'NO — text-only'}")
+print(f"   Groq gates: scene_delta>={SCENE_DELTA_MIN_TRIGGER} "
+      f"AND {GROQ_MIN_FRAMES_BETWEEN}+ frames since last call "
+      f"AND {GROQ_MIN_INTERVAL}s wall-clock")
+print(f"   Session cap: {GROQ_SESSION_CAP if GROQ_SESSION_CAP else 'disabled'} calls")
 
 # ── CELL 4: Initialize Models ────────────────────────────────
 yolo_model = YOLO('yolov8x.pt')
 print("✅ YOLOv8x loaded.")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-print(f"✅ Gemini client ready ({GEMINI_MODEL}).")
+groq_client = Groq(api_key=GROQ_API_KEY)
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY is not set. "
+                     "Set it with: export GROQ_API_KEY='gsk_...'")
+print(f"✅ Groq client ready ({GROQ_MODEL}).")
 
 print("Downloading MediaPipe gesture model...")
 urllib.request.urlretrieve(
@@ -124,9 +129,9 @@ candidate_log       = []
 rejection_log       = []
 rover_command       = "PROCEED"
 persistence_counter = defaultdict(int)
-last_gemini_call    = 0.0
-gemini_call_count   = 0         # [FIX 3] tracks total Gemini calls this session
-last_gemini_frame   = -999      # [FIX 2] frame number of last Gemini call
+last_groq_call    = 0.0
+groq_call_count   = 0         # [FIX 3] tracks total Groq calls this session
+last_groq_frame   = -999      # [FIX 2] frame number of last Groq call
 prev_frame_global   = None
 frame_count         = 0
 current_waypoint_id = None   # [R5] tracks active QML waypoint
@@ -174,47 +179,47 @@ def emit_threat(t):
     print(f"   Description  : {t.get('specific_description','N/A')}")
     print(f"   Danger score : {t.get('danger_score','?')}/10  |  Severity: {sev.upper()}")
     print(f"   Source       : {t.get('source','?')}  |  Rover cmd: {rover_command}")
-    if t.get("gemini_reasoning"):
-        print(f"   AI reasoning : {t['gemini_reasoning'][:180]}")
+    if t.get("groq_reasoning"):
+        print(f"   AI reasoning : {t['groq_reasoning'][:180]}")
 
 
 # ══════════════════════════════════════════════════════════════
 # [R1] SCENE CHANGE DETECTOR
-# Compares current YOLO detections against last Gemini-validated
-# scene. Only unlocks Gemini when the delta is meaningful.
+# Compares current YOLO detections against last Groq-validated
+# scene. Only unlocks Groq when the delta is meaningful.
 # ══════════════════════════════════════════════════════════════
 
 class SceneChangeDetector:
     """
-    Gates Gemini calls on THREE conditions (all must pass):
+    Gates Groq calls on THREE conditions (all must pass):
       1. Scene delta >= SCENE_DELTA_MIN_TRIGGER (meaningful change)
-      2. >= GEMINI_MIN_FRAMES_BETWEEN frames since last call [FIX 2]
-      3. >= GEMINI_MIN_INTERVAL wall-clock seconds since last call
+      2. >= GROQ_MIN_FRAMES_BETWEEN frames since last call [FIX 2]
+      3. >= GROQ_MIN_INTERVAL wall-clock seconds since last call
       4. Session cap not exceeded [FIX 3]
     Waypoint transitions bypass all gates except session cap.
     """
     def __init__(self):
         self.last_validated_classes   = set()
         self.last_validated_positions = {}
-        self.frames_since_gemini      = 0
+        self.frames_since_groq      = 0
         self.forced_waypoint_trigger  = False
 
     def force_trigger(self):
         self.forced_waypoint_trigger = True
-        _trace("SCENE_DELTA", "Waypoint transition → Gemini force-armed")
+        _trace("SCENE_DELTA", "Waypoint transition → Groq force-armed")
 
     def compute_delta(self, candidates, frame_w, frame_h):
         """
-        Returns (should_call_gemini: bool, delta_score: float, reasons: list).
+        Returns (should_call_groq: bool, delta_score: float, reasons: list).
         Now enforces frame-count gate and session cap in addition to delta.
         """
-        self.frames_since_gemini += 1
+        self.frames_since_groq += 1
 
         # [FIX 3] Session cap — hard stop regardless of everything else
-        if GEMINI_SESSION_CAP and gemini_call_count >= GEMINI_SESSION_CAP:
+        if GROQ_SESSION_CAP and groq_call_count >= GROQ_SESSION_CAP:
             if DEBUG_SCENE_DELTA:
                 print(f"\n   [SCENE DELTA] 🚫 SESSION CAP REACHED "
-                      f"({gemini_call_count}/{GEMINI_SESSION_CAP}) — Gemini disabled")
+                      f"({groq_call_count}/{GROQ_SESSION_CAP}) — Groq disabled")
             return False, 0.0, ["session_cap_reached"]
 
         # Waypoint force-trigger bypasses delta + frame gate (not cap)
@@ -223,12 +228,12 @@ class SceneChangeDetector:
             return True, 99.0, ["waypoint_transition"]
 
         # [FIX 2] Frame-count gate — checked before computing delta (cheap)
-        frames_since_last = frame_count - last_gemini_frame
-        if frames_since_last < GEMINI_MIN_FRAMES_BETWEEN:
+        frames_since_last = frame_count - last_groq_frame
+        if frames_since_last < GROQ_MIN_FRAMES_BETWEEN:
             if DEBUG_SCENE_DELTA:
                 print(f"\n   [SCENE DELTA] ⏭ FRAME GATE — only {frames_since_last}/"
-                      f"{GEMINI_MIN_FRAMES_BETWEEN} frames since last call")
-            return False, 0.0, [f"frame_gate:{frames_since_last}/{GEMINI_MIN_FRAMES_BETWEEN}"]
+                      f"{GROQ_MIN_FRAMES_BETWEEN} frames since last call")
+            return False, 0.0, [f"frame_gate:{frames_since_last}/{GROQ_MIN_FRAMES_BETWEEN}"]
 
         current_classes   = {c["yolo_class"] for c in candidates}
         current_positions = {}
@@ -269,10 +274,10 @@ class SceneChangeDetector:
         should_call = delta_score >= SCENE_DELTA_MIN_TRIGGER
 
         if DEBUG_SCENE_DELTA:
-            status = "🟢 GEMINI ARMED" if should_call else "⏭ GEMINI SKIPPED"
+            status = "🟢 GROQ ARMED" if should_call else "⏭ GROQ SKIPPED"
             print(f"\n   [SCENE DELTA] {status} | score={round(delta_score,2)}/{SCENE_DELTA_MIN_TRIGGER} | "
-                  f"reasons={reasons[:4]} | calls={gemini_call_count}"
-                  f"{'/' + str(GEMINI_SESSION_CAP) if GEMINI_SESSION_CAP else ''}")
+                  f"reasons={reasons[:4]} | calls={groq_call_count}"
+                  f"{'/' + str(GROQ_SESSION_CAP) if GROQ_SESSION_CAP else ''}")
 
         return should_call, delta_score, reasons
 
@@ -284,7 +289,7 @@ class SceneChangeDetector:
             cx = (b.get("x", 0) + b.get("w", 0) / 2) / max(frame_w, 1)
             cy = (b.get("y", 0) + b.get("h", 0) / 2) / max(frame_h, 1)
             self.last_validated_positions[c["yolo_class"]] = [cx, cy]
-        self.frames_since_gemini = 0
+        self.frames_since_groq = 0
         _trace("SCENE_DELTA", f"Baseline updated: {self.last_validated_classes}")
 
 
@@ -293,7 +298,7 @@ scene_change_detector = SceneChangeDetector()
 
 # ══════════════════════════════════════════════════════════════
 # [R2] OBJECT TRACKER
-# Prevents re-sending known objects to Gemini when they haven't
+# Prevents re-sending known objects to Groq when they haven't
 # meaningfully changed. Uses IoU dedup + grid-cell memory.
 # ══════════════════════════════════════════════════════════════
 
@@ -303,7 +308,7 @@ class ObjectTracker:
       Layer 1 — IoU-based NMS: merges overlapping same-class boxes
                 within a single frame's candidate list.
       Layer 2 — Grid-cell memory: remembers (class, grid_cell) pairs
-                that have already been validated by Gemini this waypoint.
+                that have already been validated by Groq this waypoint.
                 Suppresses re-sending until the rover moves to a new
                 waypoint or the object's grid position changes.
     """
@@ -360,7 +365,7 @@ class ObjectTracker:
     def filter_known(self, candidates, frame_w, frame_h):
         """
         Layer 2: suppress candidates whose (class, grid_cell) has
-        already been validated by Gemini this waypoint.
+        already been validated by Groq this waypoint.
         Returns (fresh_candidates, suppressed_count).
         """
         # Expire stale entries
@@ -382,7 +387,7 @@ class ObjectTracker:
         return fresh, suppressed
 
     def mark_validated(self, candidates, frame_w, frame_h):
-        """Record all candidates that were sent to Gemini this call."""
+        """Record all candidates that were sent to Groq this call."""
         for c in candidates:
             key = (c["yolo_class"], *self._grid_cell(c.get("bbox",{}), frame_w, frame_h))
             self.known_objects[key] = frame_count
@@ -400,24 +405,24 @@ object_tracker = ObjectTracker()
 def on_waypoint_transition(new_waypoint_id):
     """
     Call this when the rover WebSocket reports a checkpoint arrival.
-    Forces a fresh Gemini assessment and clears object memory.
+    Forces a fresh Groq assessment and clears object memory.
     """
     global current_waypoint_id
     if new_waypoint_id == current_waypoint_id: return
     current_waypoint_id = new_waypoint_id
     scene_change_detector.force_trigger()
     object_tracker.reset_for_waypoint()
-    print(f"\n🗺  WAYPOINT TRANSITION → {new_waypoint_id} | Gemini armed, tracker cleared")
+    print(f"\n🗺  WAYPOINT TRANSITION → {new_waypoint_id} | Groq armed, tracker cleared")
     _trace("WAYPOINT", f"Transitioned to {new_waypoint_id}")
 
 
 # ══════════════════════════════════════════════════════════════
 # [R3] STRIPPED ENRICHMENT PRIMITIVES
-# Only compute what Gemini cannot infer from pixels directly.
+# Only compute what Groq cannot infer from pixels directly.
 # Removed: get_dominant_colors, estimate_texture, estimate_material,
 #          classify_environment, analyze_object_relationships
 # Kept:    frame region, vertical zone, relative distance, posture
-#          (aspect ratio — trivially cheap, and Gemini needs coords)
+#          (aspect ratio — trivially cheap, and Groq needs coords)
 # ══════════════════════════════════════════════════════════════
 
 def infer_environment_tags(all_cls):
@@ -425,7 +430,7 @@ def infer_environment_tags(all_cls):
     [NEW] Cheap environment inference from detected classes only.
     Zero CV computation — pure set lookups on already-computed YOLO output.
     Replaces the expensive classify_environment() that was stripped in R3.
-    This gives Gemini the context it needs to distinguish
+    This gives Groq the context it needs to distinguish
     'TV in office = normal furniture' from 'TV blocking corridor = hazard'.
     """
     cls_set = set(all_cls)
@@ -513,7 +518,7 @@ def get_anomaly_score(cls_name, v_zone, frame_region, posture="n/a"):
 # CANDIDATE GENERATORS
 # ══════════════════════════════════════════════════════════════
 
-GEMINI_TRIGGER_CLASSES = {
+GROQ_TRIGGER_CLASSES = {
     'person','backpack','handbag','suitcase','knife','scissors',
     'cell phone','laptop','bottle','baseball bat','umbrella',
     'tie','sports ball','fire hydrant'
@@ -530,7 +535,7 @@ def generate_yolo_candidates(frame, yolo_results):
     Only bbox, class, confidence, aspect-ratio posture, frame region,
     vertical zone, relative distance, and anomaly score are computed.
     Everything else (colors, texture, material, environment, relationships)
-    is dropped — Gemini sees the image directly.
+    is dropped — Groq sees the image directly.
     """
     names            = yolo_results.names
     frame_h, frame_w = frame.shape[:2]
@@ -545,13 +550,13 @@ def generate_yolo_candidates(frame, yolo_results):
         "total_detections": len(yolo_results.boxes),
         "detected_classes": list(set(all_cls)),
         # [NEW] Cheap class-based environment inference — replaces stripped classify_environment.
-        # Gives Gemini context to distinguish 'TV in office' vs 'TV blocking corridor'.
+        # Gives Groq context to distinguish 'TV in office' vs 'TV blocking corridor'.
         "environment_tags": infer_environment_tags(all_cls),
     }
 
     _trace("YOLO", f"Raw detections: {len(yolo_results.boxes)} — {list(set(all_cls))}")
 
-    gemini_candidates = []
+    groq_candidates = []
     nav_hazards       = []
 
     for box in yolo_results.boxes:
@@ -615,7 +620,7 @@ def generate_yolo_candidates(frame, yolo_results):
                 "relative_distance":   distance,
                 "persistent":          True,
                 "bbox":                {"x":x1,"y":y1,"w":bw,"h":bh},
-                "gemini_reasoning":    "Nav hazard self-confirmed — time-critical.",
+                "groq_reasoning":      "Nav hazard self-confirmed — time-critical.",
                 "key_indicators":      [f"blocking_{fill_w}pct_width", region],
                 "timestamp":           _now_iso(),
                 "rover_position":      {"x":0.0,"y":0.0},
@@ -624,8 +629,8 @@ def generate_yolo_candidates(frame, yolo_results):
                 print(f"\n   [NAV HAZARD → SELF-EMIT] {cls_name} blocking {fill_w}% at {region}")
             continue
 
-        # ── Gemini-trigger → build lean candidate ────────────
-        if cls_name in GEMINI_TRIGGER_CLASSES and confidence >= CONF_PERSON:
+        # ── Groq-trigger → build lean candidate ────────────
+        if cls_name in GROQ_TRIGGER_CLASSES and confidence >= CONF_PERSON:
             posture       = estimate_posture(x1, y1, x2, y2) if cls_name == "person" else "n/a"
             # [BUG FIX] Pass posture to anomaly score — previously passed v_zone which
             # caused prone persons to score 0.0 when detected at mid-height in frame
@@ -641,22 +646,22 @@ def generate_yolo_candidates(frame, yolo_results):
                 "posture":           posture,         # aspect-ratio only, free
                 "anomaly_score":     anomaly_score,   # lightweight 2-signal score
                 # [R3] REMOVED: dominant_colors, texture, material_estimate,
-                #      scene_environment, object_relationships — Gemini sees image
+                #      scene_environment, object_relationships — Groq sees image
             }
-            gemini_candidates.append(candidate)
+            groq_candidates.append(candidate)
             candidate_log.append({**candidate, "frame": frame_count})
             if DEBUG_CANDIDATES:
                 print(f"\n   [YOLO CANDIDATE → QUEUE] {cls_name} conf={round(confidence,2)} "
                       f"| posture={posture} | anomaly={anomaly_score} "
                       f"| {region} {v_zone} {distance}")
 
-    return gemini_candidates, nav_hazards, scene_summary
+    return groq_candidates, nav_hazards, scene_summary
 
 
 def generate_hsv_candidates(frame):
     """
     [R4] HSV_FIRE_MIN_AREA raised 800→1500.
-    Circularity hint preserved — it's cheap and genuinely helps Gemini
+    Circularity hint preserved — it's cheap and genuinely helps Groq
     reject solid circular objects (bottles, balls) vs. real fire.
     """
     hsv              = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -794,7 +799,7 @@ def generate_motion_candidate(frame, prev_frame):
 
 
 # ══════════════════════════════════════════════════════════════
-# [R6] COMPRESSED GEMINI PROMPT
+# [R6] COMPRESSED GROQ PROMPT
 # Cut ~60% of token count. Removed: embedded examples, verbose
 # scoring guide, redundant rules. Kept: core task, output schema,
 # critical FP-rejection rules, and the scoring scale.
@@ -848,13 +853,13 @@ CRITICAL RULES — READ environment_tags FROM SCENE CONTEXT FIRST:
 
 def assess_all_candidates(frame, all_candidates, scene_summary):
     """
-    [R1+R2+R6] Scene-gated, deduplicated, compressed Gemini call.
+    [R1+R2+R6] Scene-gated, deduplicated, compressed Groq call.
     """
-    global last_gemini_call, gemini_call_count, last_gemini_frame
+    global last_groq_call, groq_call_count, last_groq_frame
     frame_h, frame_w = frame.shape[:2]
 
     if not all_candidates:
-        _trace("GEMINI", "No candidates — skip")
+        _trace("GROQ", "No candidates — skip")
         return [], []
 
     # [R2] Layer 1: IoU dedup within this frame's candidate list
@@ -867,7 +872,7 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
         _trace("TRACKER", f"Suppressed {suppressed_count} known objects")
 
     if not all_candidates:
-        _trace("GEMINI", "All candidates suppressed by tracker — skip")
+        _trace("GROQ", "All candidates suppressed by tracker — skip")
         return [], []
 
     # [R1] Scene change gate
@@ -875,36 +880,34 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
         all_candidates, frame_w, frame_h)
 
     now = time.time()
-    rate_ok = (now - last_gemini_call) >= GEMINI_MIN_INTERVAL
+    rate_ok = (now - last_groq_call) >= GROQ_MIN_INTERVAL
 
     if not should_call:
-        _trace("GEMINI", f"Scene unchanged (delta={delta_score:.2f}) — skip")
+        _trace("GROQ", f"Scene unchanged (delta={delta_score:.2f}) — skip")
         return [], []
     if not rate_ok:
-        wait = round(GEMINI_MIN_INTERVAL - (now - last_gemini_call), 1)
-        _trace("GEMINI", f"Rate limited — {wait}s remaining")
-        print(f"   [GEMINI] Rate limit — {wait}s to next call")
+        wait = round(GROQ_MIN_INTERVAL - (now - last_groq_call), 1)
+        _trace("GROQ", f"Rate limited — {wait}s remaining")
+        print(f"   [GROQ] Rate limit — {wait}s to next call")
         return _fallback_unverified(all_candidates), []
 
-    last_gemini_call  = now
-    last_gemini_frame = frame_count        # [FIX 2] record frame number of this call
-    gemini_call_count += 1                 # [FIX 3] increment session counter
+    last_groq_call  = now
+    last_groq_frame = frame_count        # [FIX 2] record frame number of this call
+    groq_call_count += 1                 # [FIX 3] increment session counter
     t_start = time.time()
-    _trace("GEMINI", f"Calling Gemini: {len(all_candidates)} candidates | "
+    _trace("GROQ", f"Calling Groq: {len(all_candidates)} candidates | "
                      f"delta={delta_score:.2f} reasons={delta_reasons[:3]}")
     print(f"\n{'─'*55}")
-    print(f"🤖 GEMINI CALL #{gemini_call_count}"
-          + (f"/{GEMINI_SESSION_CAP}" if GEMINI_SESSION_CAP else "")
+    print(f"🤖 GROQ CALL #{groq_call_count}"
+          + (f"/{GROQ_SESSION_CAP}" if GROQ_SESSION_CAP else "")
           + f" — {len(all_candidates)} candidates (delta={round(delta_score,2)})")
     for c in all_candidates:
         print(f"   → [{c['candidate_source']}] {c['yolo_class']} "
               f"| anomaly={c.get('anomaly_score',0)}")
 
     try:
-        # [GEMMA COMPAT] Build prompt — for text-only models (Gemma), inject
-        # per-candidate spatial descriptions since there is no image to look at.
-        # For multimodal models (Gemini), this extra text is still harmless and
-        # slightly reduces the model's reliance on pixel-level reasoning.
+        # Build per-candidate text descriptions to augment the prompt with spatial metadata.
+        # This improves reasoning quality when the model cannot resolve fine details from pixels alone.
         def _candidate_text_desc(c):
             parts = [
                 f"class={c['yolo_class']}",
@@ -929,7 +932,7 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
                 parts.append(f"upper_edge_density={c['upper_edge_density']}")
             return " | ".join(parts)
 
-        # Augment candidates_json with inline text descriptions for text-only models
+        # Augment candidates_json with inline text descriptions
         candidates_with_desc = []
         for c in all_candidates:
             augmented = dict(c)
@@ -945,36 +948,43 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
             }, indent=2)
         )
 
-        if DEBUG_GEMINI_PROMPT:
-            print(f"\n[GEMINI PROMPT — {len(prompt)} chars]\n{prompt[:800]}...\n")
+        if DEBUG_GROQ_PROMPT:
+            print(f"\n[GROQ PROMPT — {len(prompt)} chars]\n{prompt[:800]}...\n")
 
-        # [GEMMA COMPAT] Gemma models on AI Studio are text-only — no image input.
-        # Gemini models are multimodal — include image for pixel-level reasoning.
-        if MODEL_IS_MULTIMODAL:
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            pil_img   = Image.open(io.BytesIO(buffer.tobytes()))
-            contents  = [prompt, pil_img]
-        else:
-            contents  = [prompt]
+        # Build Groq chat messages — include image as base64 for pixel-level reasoning.
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        b64_image = base64.b64encode(buffer.tobytes()).decode("utf-8")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                    },
+                ],
+            }
+        ]
 
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config={"timeout": GEMINI_REQUEST_TIMEOUT},
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            timeout=GROQ_REQUEST_TIMEOUT,
         )
-        raw = response.text.strip()
+        raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"): raw = raw[4:]
         raw = raw.strip()
 
-        if DEBUG_GEMINI_RAW:
-            print(f"\n[GEMINI RAW]\n{raw[:600]}{'...' if len(raw)>600 else ''}\n")
+        if DEBUG_GROQ_RAW:
+            print(f"\n[GROQ RAW]\n{raw[:600]}{'...' if len(raw)>600 else ''}\n")
 
         elapsed = round(time.time() - t_start, 2)
         parsed  = json.loads(raw)
         if DEBUG_STAGE_TIMINGS:
-            print(f"   ⏱ Gemini: {elapsed}s | prompt ~{len(prompt)//4} tokens")
+            print(f"   ⏱ Groq: {elapsed}s | prompt ~{len(prompt)//4} tokens")
 
         # [R1+R2] Update both trackers on successful call
         scene_change_detector.mark_validated(all_candidates, frame_w, frame_h)
@@ -983,7 +993,7 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
         confirmed_threats = []
         rejected          = []
 
-        print(f"\n🤖 GEMINI VERDICTS:")
+        print(f"\n🤖 GROQ VERDICTS:")
         for a in parsed.get("assessments", []):
             is_confirmed = a.get("confirmed", False)
             danger_score = a.get("danger_score", 0)
@@ -1001,7 +1011,7 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
                 rejected.append(entry)
                 rejection_log.append(entry)
                 print(f"   ❌ REJECTED [{source}] {cls} — {a.get('rejection_reason','')[:80]}")
-                _trace("GEMINI_REJECT", f"Rejected {cls}")
+                _trace("GROQ_REJECT", f"Rejected {cls}")
                 continue
 
             if danger_score < DANGER_THRESHOLD and "survivor" not in subject_type:
@@ -1014,11 +1024,11 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
                 "specific_description":a.get("specific_description", cls),
                 "subject_type":        subject_type,
                 "threat_confirmed":    True,
-                "category":            "gemini_validated",
+                "category":            "groq_validated",
                 "danger_score":        danger_score,
                 "severity":            a.get("severity", "low"),
                 "confidence":          tag.get("confidence", 0.0),
-                "gemini_reasoning":    a.get("reasoning", ""),
+                "groq_reasoning":      a.get("reasoning", ""),
                 "key_indicators":      a.get("key_indicators", []),
                 "recommended_action":  a.get("recommended_action", "log_only"),
                 "rover_approach_risk": a.get("rover_approach_risk", "approach_with_caution"),
@@ -1030,7 +1040,7 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
                 "relative_distance":   tag.get("relative_distance", "unknown"),
                 "posture":             tag.get("posture", "n/a"),
                 "anomaly_score":       tag.get("anomaly_score", 0.0),
-                "source":              f"gemini+{source}",
+                "source":              f"groq+{source}",
                 "persistent":          True,
                 "bbox":                tag.get("bbox", {"x":0,"y":0,"w":0,"h":0}),
                 "timestamp":           _now_iso(),
@@ -1049,7 +1059,7 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
         print(f"⚠ JSON parse error: {e}")
         return _fallback_unverified(all_candidates), []
     except Exception as e:
-        print(f"⚠ Gemini error: {e}")
+        print(f"⚠ Groq error: {e}")
         return _fallback_unverified(all_candidates), []
 
 
@@ -1058,19 +1068,19 @@ def _fallback_unverified(candidates):
         "threat_type":         c["yolo_class"],
         "specific_description":(f"UNVERIFIED: {c['yolo_class']} at "
                                  f"{c.get('frame_region','?')}, {c.get('relative_distance','?')} "
-                                 f"— Gemini unavailable"),
+                                 f"— Groq unavailable"),
         "subject_type":        "unverified_pending_assessment",
         "threat_confirmed":    False,
         "category":            "fallback_unverified",
         "danger_score":        3,
         "severity":            "medium",
         "confidence":          c.get("confidence", 0.0),
-        "gemini_reasoning":    "Gemini unavailable",
+        "groq_reasoning":      "Groq unavailable",
         "source":              "fallback",
         "bbox":                c.get("bbox", {"x":0,"y":0,"w":0,"h":0}),
         "timestamp":           _now_iso(),
         "rover_position":      {"x":0.0,"y":0.0},
-        "_rejection_reason":   "Gemini unavailable",
+        "_rejection_reason":   "Groq unavailable",
     } for c in candidates]
 
 
@@ -1141,7 +1151,7 @@ def run_sentinel_pipeline(frame, verbose=True, waypoint_id=None):
     for h in nav_hazards:
         emit_threat(h)
 
-    # ── Stage 2: Gated, deduplicated Gemini validation ──────
+    # ── Stage 2: Gated, deduplicated Groq validation ──────
     # [R1] SceneChangeDetector gates the call
     # [R2] ObjectTracker deduplicates within this call
     # [R6] Compressed prompt reduces latency
@@ -1151,7 +1161,7 @@ def run_sentinel_pipeline(frame, verbose=True, waypoint_id=None):
         emit_threat(t)
 
     if DEBUG_STAGE_TIMINGS:
-        print(f"   ⏱ Stage 2 (Gemini): {round(time.time()-t2,2)}s")
+        print(f"   ⏱ Stage 2 (Groq): {round(time.time()-t2,2)}s")
 
     gesture = detect_gesture(frame)
     if gesture:
@@ -1184,9 +1194,9 @@ def run_sentinel_pipeline(frame, verbose=True, waypoint_id=None):
 # ── Visualization (unchanged from v5) ────────────────────────
 SEVERITY_COLORS_BGR = {"critical":(50,50,255),"high":(0,140,255),
                         "medium":(0,200,255),"low":(0,200,0),"attention":(200,200,0)}
-SOURCE_COLORS_BGR   = {"yolo_nav":(0,165,255),"gemini+yolo":(255,50,50),
-                        "gemini+hsv_fire":(0,50,255),"gemini+hsv_smoke":(100,100,200),
-                        "gemini+cv_structural":(0,200,200),"gemini+motion":(200,200,0),
+SOURCE_COLORS_BGR   = {"yolo_nav":(0,165,255),"groq+yolo":(255,50,50),
+                        "groq+hsv_fire":(0,50,255),"groq+hsv_smoke":(100,100,200),
+                        "groq+cv_structural":(0,200,200),"groq+motion":(200,200,0),
                         "fallback":(150,150,150)}
 
 def draw_rich_overlay(frame, output):
@@ -1234,9 +1244,9 @@ def display_results(frame, output):
     legend_patches = [
         mpatches.Patch(color='gray',   label='Candidate (considered)'),
         mpatches.Patch(color='orange', label='Nav hazard (self-emit)'),
-        mpatches.Patch(color='red',    label='Gemini confirmed YOLO'),
-        mpatches.Patch(color='blue',   label='Gemini confirmed fire'),
-        mpatches.Patch(color='cyan',   label='Gemini confirmed structural'),
+        mpatches.Patch(color='red',    label='Groq confirmed YOLO'),
+        mpatches.Patch(color='blue',   label='Groq confirmed fire'),
+        mpatches.Patch(color='cyan',   label='Groq confirmed structural'),
     ]
     ax1.legend(handles=legend_patches, loc='lower left', fontsize=7, framealpha=0.7)
     ax2 = fig.add_subplot(1,3,3)
@@ -1277,9 +1287,9 @@ def print_pipeline_trace(last_n=30):
 def print_session_stats():
     confirmed = [t for t in threat_log if t.get("threat_confirmed")]
     survivors = [t for t in threat_log if "survivor" in t.get("subject_type","")]
-    gemini_calls = sum(1 for e in pipeline_trace if e["stage"]=="GEMINI"
+    groq_calls = sum(1 for e in pipeline_trace if e["stage"]=="GROQ"
                        and "Calling" in e.get("message",""))
-    skipped_calls = sum(1 for e in pipeline_trace if e["stage"]=="GEMINI"
+    skipped_calls = sum(1 for e in pipeline_trace if e["stage"]=="GROQ"
                         and "skip" in e.get("message","").lower())
     print(f"\n{'='*62}\nSESSION STATS\n{'='*62}")
     print(f"  Frames processed    : {frame_count}")
@@ -1287,12 +1297,12 @@ def print_session_stats():
     print(f"  Threats emitted     : {len(threat_log)}")
     print(f"  Confirmed threats   : {len(confirmed)}")
     print(f"  Survivors found     : {len(survivors)}")
-    print(f"  Gemini calls fired  : {gemini_calls}")
-    print(f"  Gemini calls skipped: {skipped_calls}  [R1 savings]")
-    if gemini_calls + skipped_calls > 0:
-        skip_pct = round(skipped_calls/(gemini_calls+skipped_calls)*100)
-        print(f"  Scene-gate savings  : {skip_pct}% of potential Gemini calls avoided")
-    print(f"  Rejections by Gemini: {len(rejection_log)}")
+    print(f"  Groq calls fired    : {groq_calls}")
+    print(f"  Groq calls skipped  : {skipped_calls}  [R1 savings]")
+    if groq_calls + skipped_calls > 0:
+        skip_pct = round(skipped_calls/(groq_calls+skipped_calls)*100)
+        print(f"  Scene-gate savings  : {skip_pct}% of potential Groq calls avoided")
+    print(f"  Rejections by Groq  : {len(rejection_log)}")
     if candidate_log:
         src_counts = defaultdict(int)
         for c in candidate_log: src_counts[c["candidate_source"]] += 1
@@ -1314,11 +1324,11 @@ def print_session_stats():
 #   • .zip of images        → extracted, sorted, sequential
 #   • single image          → single-frame debug run
 #
-# GEMINI GATING (all three gates must pass):
+# GROQ GATING (all three gates must pass):
 #   Gate 1 — SceneChangeDetector: delta >= SCENE_DELTA_MIN_TRIGGER
-#   Gate 2 — Frame count: >= GEMINI_MIN_FRAMES_BETWEEN since last call
-#   Gate 3 — Wall clock: >= GEMINI_MIN_INTERVAL seconds since last call
-#   Hard cap: GEMINI_SESSION_CAP total calls per session
+#   Gate 2 — Frame count: >= GROQ_MIN_FRAMES_BETWEEN since last call
+#   Gate 3 — Wall clock: >= GROQ_MIN_INTERVAL seconds since last call
+#   Hard cap: GROQ_SESSION_CAP total calls per session
 # ============================================================
 
 # ── CELL 13: Loop configuration ──────────────────────────────
@@ -1435,9 +1445,9 @@ def run_loop():
         return
 
     processed_count       = 0
-    gemini_fired          = 0
-    gemini_skipped_delta  = 0
-    gemini_skipped_rate   = 0
+    groq_fired          = 0
+    groq_skipped_delta  = 0
+    groq_skipped_rate   = 0
     total_threats         = 0
     total_rejected        = 0
     loop_start            = time.time()
@@ -1445,7 +1455,7 @@ def run_loop():
     print(f"\n{'='*62}")
     print(f"SENTINEL LOOP STARTED — input={input_type}")
     print(f"Scene-change gating: delta>={SCENE_DELTA_MIN_TRIGGER} required")
-    print(f"Rate limit: >={GEMINI_MIN_INTERVAL}s between calls")
+    print(f"Rate limit: >={GROQ_MIN_INTERVAL}s between calls")
     print(f"{'='*62}\n")
 
     for raw_idx, frame in frame_iter:
@@ -1455,20 +1465,20 @@ def run_loop():
         output = run_sentinel_pipeline(frame, verbose=False)
 
         recent_traces = [e for e in pipeline_trace if e["frame"] == frame_count]
-        gemini_trace  = [e for e in recent_traces if e["stage"] == "GEMINI"]
-        last_g        = gemini_trace[-1]["message"] if gemini_trace else ""
+        groq_trace    = [e for e in recent_traces if e["stage"] == "GROQ"]
+        last_g        = groq_trace[-1]["message"] if groq_trace else ""
 
-        if "Calling Gemini" in last_g:
-            gemini_fired += 1
-            gemini_status = "🤖 GEMINI CALLED"
+        if "Calling Groq" in last_g:
+            groq_fired += 1
+            groq_status = "🤖 GROQ CALLED"
         elif "Scene unchanged" in last_g or "skip" in last_g.lower():
-            gemini_skipped_delta += 1
-            gemini_status = "⏭  scene unchanged"
+            groq_skipped_delta += 1
+            groq_status = "⏭  scene unchanged"
         elif "Rate limit" in last_g:
-            gemini_skipped_rate += 1
-            gemini_status = "⏳ rate limited"
+            groq_skipped_rate += 1
+            groq_status = "⏳ rate limited"
         else:
-            gemini_status = "⚪ no candidates"
+            groq_status = "⚪ no candidates"
 
         total_threats  += len(output["all_threats"])
         total_rejected += output["rejected_count"]
@@ -1484,7 +1494,7 @@ def run_loop():
 
         print(f"[F{frame_count:04d}/raw{raw_idx}] "
               f"{cmd_icon.get(output['rover_command'],'  ')} {output['rover_command']:7} | "
-              f"{gemini_status:22} | "
+              f"{groq_status:22} | "
               f"threats={len(output['all_threats'])} rej={output['rejected_count']} | "
               f"{frame_ms}ms{threat_str}")
 
@@ -1501,7 +1511,7 @@ def run_loop():
             plt.figure(figsize=(14, 7))
             plt.imshow(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
             plt.axis('off')
-            plt.title(f"Frame {frame_count} — {output['rover_command']} — {gemini_status}",
+            plt.title(f"Frame {frame_count} — {output['rover_command']} — {groq_status}",
                       fontsize=11)
             plt.tight_layout()
             plt.show()
@@ -1513,23 +1523,23 @@ def run_loop():
         if SUMMARY_EVERY_N and processed_count % SUMMARY_EVERY_N == 0:
             elapsed  = round(time.time() - loop_start, 1)
             fps_eff  = round(processed_count / elapsed, 1) if elapsed > 0 else 0
-            total_g  = gemini_fired + gemini_skipped_delta + gemini_skipped_rate
-            skip_pct = round((gemini_skipped_delta + gemini_skipped_rate) / max(total_g,1) * 100)
+            total_g  = groq_fired + groq_skipped_delta + groq_skipped_rate
+            skip_pct = round((groq_skipped_delta + groq_skipped_rate) / max(total_g,1) * 100)
             print(f"\n{'─'*62}")
             print(f"SUMMARY @ frame {frame_count} ({elapsed}s | {fps_eff} fps effective)")
-            print(f"  Gemini: {gemini_fired} fired | {gemini_skipped_delta} scene-skipped | "
-                  f"{gemini_skipped_rate} rate-skipped | {skip_pct}% avoided")
+            print(f"  Groq  : {groq_fired} fired | {groq_skipped_delta} scene-skipped | "
+                  f"{groq_skipped_rate} rate-skipped | {skip_pct}% avoided")
             print(f"  Threats: {total_threats} emitted | {total_rejected} rejected")
             print(f"{'─'*62}\n")
 
     elapsed  = round(time.time() - loop_start, 1)
     fps_eff  = round(processed_count / elapsed, 1) if elapsed > 0 else 0
-    total_g  = gemini_fired + gemini_skipped_delta + gemini_skipped_rate
-    skip_pct = round((gemini_skipped_delta + gemini_skipped_rate) / max(total_g,1) * 100)
+    total_g  = groq_fired + groq_skipped_delta + groq_skipped_rate
+    skip_pct = round((groq_skipped_delta + groq_skipped_rate) / max(total_g,1) * 100)
 
     print(f"\n{'='*62}\nLOOP COMPLETE\n{'='*62}")
     print(f"  Frames processed : {processed_count} in {elapsed}s ({fps_eff} fps)")
-    print(f"  Gemini calls     : {gemini_fired} fired | {skip_pct}% avoided")
+    print(f"  Groq calls       : {groq_fired} fired | {skip_pct}% avoided")
     print(f"  Threats emitted  : {total_threats} | Rejected: {total_rejected}")
 
     confirmed = [t for t in threat_log if t.get("threat_confirmed")]
@@ -1585,7 +1595,7 @@ DROIDCAM_SOURCE              = 0     # USB: integer device index (0, 1, 2...)
 DROIDCAM_PROCESS_EVERY_N_FRAMES = 6  # pipeline runs on every 6th raw frame
                                      # DroidCam streams at ~30fps →
                                      # 30/6 = 5 pipeline calls/sec max
-                                     # (Gemini gates reduce this further)
+                                     # (Groq gates reduce this further)
 DROIDCAM_MAX_PIPELINE_FRAMES = 0     # 0 = run until interrupted
                                      # set e.g. 300 to auto-stop after 300 processed
 DROIDCAM_DISPLAY_EVERY_N     = 15    # show annotated frame in Colab every N processed
@@ -1601,7 +1611,7 @@ def run_droidcam_stream(waypoint_id=None):
 
     Args:
         waypoint_id: Optional string. If set, signals a waypoint transition
-                     on the first frame (forces fresh Gemini call, clears tracker).
+                     on the first frame (forces fresh Groq call, clears tracker).
                      Pass a new waypoint_id mid-run by calling
                      on_waypoint_transition("checkpoint_N") from another cell.
     """
@@ -1627,9 +1637,9 @@ def run_droidcam_stream(waypoint_id=None):
     print(f"   Source       : {DROIDCAM_SOURCE}")
     print(f"   Processing   : every {DROIDCAM_PROCESS_EVERY_N_FRAMES} raw frames "
           f"(~{actual_fps/DROIDCAM_PROCESS_EVERY_N_FRAMES:.1f} pipeline fps max)")
-    print(f"   Gemini gates : delta>={SCENE_DELTA_MIN_TRIGGER} "
-          f"AND {GEMINI_MIN_FRAMES_BETWEEN}+ frames AND {GEMINI_MIN_INTERVAL}s")
-    print(f"   Session cap  : {GEMINI_SESSION_CAP} Gemini calls max")
+    print(f"   Groq gates   : delta>={SCENE_DELTA_MIN_TRIGGER} "
+          f"AND {GROQ_MIN_FRAMES_BETWEEN}+ frames AND {GROQ_MIN_INTERVAL}s")
+    print(f"   Session cap  : {GROQ_SESSION_CAP} Groq calls max")
     print(f"   Stop         : interrupt this cell (■ button)\n")
 
     if waypoint_id:
@@ -1671,8 +1681,8 @@ def run_droidcam_stream(waypoint_id=None):
 
             print(f"[{elapsed:6.1f}s | F{frame_count:04d}] "
                   f"{cmd_icon.get(output['rover_command'],'  ')} {output['rover_command']:7} | "
-                  f"Gemini calls: {gemini_call_count}"
-                  f"{'/' + str(GEMINI_SESSION_CAP) if GEMINI_SESSION_CAP else ''} | "
+                  f"Groq calls: {groq_call_count}"
+                  f"{'/' + str(GROQ_SESSION_CAP) if GROQ_SESSION_CAP else ''} | "
                   f"threats={len(output['all_threats'])}{threat_summary}")
 
             for t in output["all_threats"]:
@@ -1690,7 +1700,7 @@ def run_droidcam_stream(waypoint_id=None):
                 plt.imshow(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
                 plt.axis('off')
                 plt.title(f"DroidCam F{frame_count} | {output['rover_command']} | "
-                          f"Gemini calls: {gemini_call_count}", fontsize=11)
+                          f"Groq calls: {groq_call_count}", fontsize=11)
                 plt.tight_layout()
                 plt.show()
 
@@ -1703,8 +1713,8 @@ def run_droidcam_stream(waypoint_id=None):
                 )
 
             # ── Session cap reached — stop gracefully ─────────
-            if GEMINI_SESSION_CAP and gemini_call_count >= GEMINI_SESSION_CAP:
-                print(f"\n🚫 Session cap reached ({GEMINI_SESSION_CAP} calls) — stopping stream.")
+            if GROQ_SESSION_CAP and groq_call_count >= GROQ_SESSION_CAP:
+                print(f"\n🚫 Session cap reached ({GROQ_SESSION_CAP} calls) — stopping stream.")
                 break
 
             # ── Max frames reached ────────────────────────────
@@ -1724,7 +1734,7 @@ def run_droidcam_stream(waypoint_id=None):
         print(f"  Duration         : {elapsed}s")
         print(f"  Raw frames read  : {raw_frame_idx}")
         print(f"  Pipeline runs    : {processed_count}")
-        print(f"  Gemini calls     : {gemini_call_count}")
+        print(f"  Groq calls       : {groq_call_count}")
         confirmed = [t for t in threat_log if t.get("threat_confirmed")]
         survivors = [t for t in threat_log if "survivor" in t.get("subject_type","")]
         print(f"  Confirmed threats: {len(confirmed)}")

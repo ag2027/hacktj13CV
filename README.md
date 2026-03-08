@@ -8,6 +8,7 @@ This project uses a hybrid architecture:
 ## Files
 - `rover_hybrid.ino`: Arduino firmware
 - `rover_nav.py`: Python serial navigation controller (`DecisionEngine`)
+- `cv_server.py`: Computer-vision threat-assessment pipeline (YOLO + Groq AI)
 - `QML/qml_decision_engine.py`: QML steering/action model for rover decisions
 - `QML/qml_simulator_app.py`: Flask simulator for distance-to-action testing
 - `QML/qml_route_planner.py`: Grid patrol routing (classical + PennyLane QML)
@@ -17,6 +18,32 @@ This project uses a hybrid architecture:
 - `QML/templates/index.html`: QML decision simulator UI
 - `QML/templates/grid_qml.html`: 2D animated grid patrol UI
 - `requirements.txt`: Python dependencies
+- `.env.example`: Template for your secret API key (copy to `.env`)
+
+## Setting Your Groq API Key (cv_server.py)
+
+The CV pipeline uses [Groq](https://console.groq.com) for AI threat assessment.
+Your key is **never stored in the code or committed to git**.
+
+### Steps
+1. Get a free key at **https://console.groq.com** → API Keys.
+2. Copy the example env file:
+   ```bash
+   cp .env.example .env
+   ```
+3. Open `.env` and replace the placeholder:
+   ```
+   GROQ_API_KEY=gsk_your_actual_key_here
+   ```
+4. `.env` is listed in `.gitignore` — it will never be committed.
+
+> **Colab users:** add a Colab secret named `GROQ_API_KEY` (🔑 icon in the left sidebar),
+> then at the top of your notebook run:
+> ```python
+> import os
+> from google.colab import userdata
+> os.environ["GROQ_API_KEY"] = userdata.get("GROQ_API_KEY")
+> ```
 
 ## Wiring Assumptions
 

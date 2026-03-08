@@ -5,3 +5,4 @@ artifacts_check/
 artifacts_check2/
 mine_unsafe_source.csv
 training_data_timeline_demo.csv
+.env
