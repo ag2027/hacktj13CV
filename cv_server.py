@@ -18,99 +18,81 @@ from ultralytics import YOLO
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from google.colab import files
+import argparse
+from pathlib import Path
+from dotenv import load_dotenv
 import numpy as np
 from groq import Groq
 import base64
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
-import json, time, urllib.request, math, io
+import json, time, urllib.request, math, io, os, getpass
 from datetime import datetime, timezone
 from collections import defaultdict
 from PIL import Image
 
+
+
 print("✅ All imports successful.")
 
-# ── CELL 3: Configuration ────────────────────────────────────
-import os
-from dotenv import load_dotenv
-load_dotenv()  # loads GROQ_API_KEY from a .env file if present (never committed)
 
-GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
-# Model options (groq SDK + console.groq.com API key):
-#   "meta-llama/llama-4-scout-17b-16e-instruct" — latest multimodal ✓  ← recommended
-#   "llama-3.2-90b-vision-preview"  — smarter, multimodal ✓
-#   "llama-3.2-11b-vision-preview"  — fast, multimodal ✓
-# NOTE: All Groq vision models are multimodal (image + text input supported).
-# To set your key: copy .env.example → .env and fill in GROQ_API_KEY=gsk_...
-GROQ_MODEL       = "meta-llama/llama-4-scout-17b-16e-instruct"
+load_dotenv()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY is not set. Put it in .env or export it in your shell.")
 
-# All Groq vision models support image input.
+
+
+GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 MODEL_IS_MULTIMODAL = True
-
-# Request timeout — prevents indefinite hang on bad model strings or network issues.
 GROQ_REQUEST_TIMEOUT = 45
 
 DANGER_THRESHOLD       = 5
-GROQ_MIN_INTERVAL    = 3.0   # wall-clock seconds — kept as backstop
+GROQ_MIN_INTERVAL      = 3.0
 
-# [R4] Raised thresholds — reduces garbage candidates
 CONF_PERSON            = 0.40
-CONF_OBJECT            = 0.40  # was 0.30 — eliminates low-confidence noise
+CONF_OBJECT            = 0.40
 PERSISTENCE_THRESHOLD  = 2
 MOTION_MIN_AREA        = 1200
 MOTION_THRESHOLD       = 22
-HSV_FIRE_MIN_AREA      = 1500  # was 800 — cuts small orange-patch false positives
+HSV_FIRE_MIN_AREA      = 1500
 HSV_SMOKE_MIN_COVERAGE = 0.15
 YOLO_IMGSZ             = 640
 
-# [R1] Scene-change gating parameters
-SCENE_DELTA_NEW_CLASS_WEIGHT  = 1.0  # full point for a brand-new class appearing
-SCENE_DELTA_BBOX_MOVE_THRESH  = 0.15 # fraction of frame width = significant move
-# [FIX 1] Raised 1.0 → 2.5 — requires multiple meaningful changes before Groq fires.
-# Scoring: new class=+1.0, class gone=+0.5, significant move=+0.5, special candidate=+0.8
-# Examples: 3 new classes=3.0 ✓ | 2 new + fire=2.8 ✓ | 1 new + fire=1.8 ✗
+SCENE_DELTA_NEW_CLASS_WEIGHT  = 1.0
+SCENE_DELTA_BBOX_MOVE_THRESH  = 0.15
 SCENE_DELTA_MIN_TRIGGER       = 2.5
 
-# [FIX 2] NEW — minimum processed frames between any two Groq calls.
-# Frame-count based, not time-based — actually limits calls during video processing.
-# At FRAME_SKIP=3 on 30fps: 8 processed frames ≈ 0.8s of real footage between calls.
-GROQ_MIN_FRAMES_BETWEEN     = 8
+GROQ_MIN_FRAMES_BETWEEN = 8
+GROQ_SESSION_CAP        = 40
 
-# [FIX 3] NEW — hard cap on total Groq calls per session.
-# Free tier: 1,500/day. 40 calls is conservative, leaves room for multiple runs.
-# Set to 0 to disable.
-GROQ_SESSION_CAP            = 40
+IOU_DEDUP_THRESHOLD = 0.50
+GRID_CELLS_X        = 10
+GRID_CELLS_Y        = 8
+TRACKER_TTL_FRAMES  = 20
 
-# [R2] Object tracker parameters
-IOU_DEDUP_THRESHOLD    = 0.50  # merge same-class boxes with IoU > this
-GRID_CELLS_X           = 10    # frame divided into 10x8 grid for position quantization
-GRID_CELLS_Y           = 8
-TRACKER_TTL_FRAMES     = 20    # known objects expire after this many frames
-
-# Debug flags
-DEBUG_CANDIDATES       = True
+DEBUG_CANDIDATES     = True
 DEBUG_GROQ_PROMPT    = False
 DEBUG_GROQ_RAW       = True
-DEBUG_STAGE_TIMINGS    = True
-DEBUG_SCENE_DELTA      = True  # [R1] show what triggered (or suppressed) Groq
+DEBUG_STAGE_TIMINGS  = True
+DEBUG_SCENE_DELTA    = True
 
 print("✅ Config set.")
-print(f"   Model: {GROQ_MODEL} | multimodal={'YES' if MODEL_IS_MULTIMODAL else 'NO — text-only'}")
+print(f"   Model: {GROQ_MODEL} | multimodal={'YES' if MODEL_IS_MULTIMODAL else 'NO'}")
 print(f"   Groq gates: scene_delta>={SCENE_DELTA_MIN_TRIGGER} "
       f"AND {GROQ_MIN_FRAMES_BETWEEN}+ frames since last call "
       f"AND {GROQ_MIN_INTERVAL}s wall-clock")
 print(f"   Session cap: {GROQ_SESSION_CAP if GROQ_SESSION_CAP else 'disabled'} calls")
 
+
 # ── CELL 4: Initialize Models ────────────────────────────────
-yolo_model = YOLO('yolov8x.pt')
+yolo_model = YOLO("yolov8x.pt")
 print("✅ YOLOv8x loaded.")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY is not set. "
-                     "Set it with: export GROQ_API_KEY='gsk_...'")
+    raise ValueError("GROQ_API_KEY is not set.")
 print(f"✅ Groq client ready ({GROQ_MODEL}).")
 
 print("Downloading MediaPipe gesture model...")
@@ -119,7 +101,14 @@ urllib.request.urlretrieve(
     "gesture_recognizer/float16/1/gesture_recognizer.task",
     "gesture_recognizer.task"
 )
+
+gesture_options = mp_vision.GestureRecognizerOptions(
+    base_options=mp_python.BaseOptions(model_asset_path="gesture_recognizer.task")
+)
+gesture_recognizer = mp_vision.GestureRecognizer.create_from_options(gesture_options)
+
 print("✅ MediaPipe ready.")
+
 
 # ── CELL 5: Threat State ─────────────────────────────────────
 threat_log          = []
@@ -427,22 +416,16 @@ def on_waypoint_transition(new_waypoint_id):
 
 def infer_environment_tags(all_cls):
     """
-    [NEW] Cheap environment inference from detected classes only.
-    Zero CV computation — pure set lookups on already-computed YOLO output.
-    Replaces the expensive classify_environment() that was stripped in R3.
-    This gives Groq the context it needs to distinguish
-    'TV in office = normal furniture' from 'TV blocking corridor = hazard'.
+    Cheap environment inference from detected classes only.
     """
     cls_set = set(all_cls)
-    tags    = []
+    tags = []
 
-    # Workspace / office
     if {'laptop', 'chair'} & cls_set:
         tags.append("office_or_workspace")
     if {'laptop', 'tv', 'monitor'} & cls_set and 'person' in cls_set:
         tags.append("occupied_workspace")
 
-    # Residential
     if 'bed' in cls_set:
         tags.append("residential_bedroom")
     if {'toilet', 'sink'} & cls_set:
@@ -450,23 +433,29 @@ def infer_environment_tags(all_cls):
     if {'couch', 'tv'} & cls_set and 'laptop' not in cls_set:
         tags.append("living_area")
 
-    # Outdoor / transit
     if {'car', 'truck', 'bus', 'motorcycle'} & cls_set:
         tags.append("vehicle_or_outdoor_area")
 
-    # Clutter / chaos — potential distress context
-    furniture_count = sum(1 for c in all_cls
-                          if c in {'chair','couch','bed','dining table','bench'})
+    furniture_count = sum(
+        1 for c in all_cls
+        if c in {'chair', 'couch', 'bed', 'dining table', 'bench'}
+    )
     if furniture_count >= 4:
         tags.append("heavily_cluttered_possible_evacuation_or_damage")
 
     if not tags:
         tags.append("environment_unknown")
     return tags
+
+
+def get_frame_region(x_center, frame_width):
     thirds = frame_width / 3
-    if x_center < thirds:     return "left"
-    if x_center < 2 * thirds: return "center"
+    if x_center < thirds:
+        return "left"
+    if x_center < 2 * thirds:
+        return "center"
     return "right"
+
 
 def get_vertical_zone(y_center, frame_height):
     if y_center < frame_height * 0.33: return "upper"
@@ -968,10 +957,12 @@ def assess_all_candidates(frame, all_candidates, scene_summary):
         ]
 
         response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            timeout=GROQ_REQUEST_TIMEOUT,
-        )
+    model=GROQ_MODEL,
+    messages=messages,
+    timeout=GROQ_REQUEST_TIMEOUT,
+    response_format={"type": "json_object"},
+)
+
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -1093,18 +1084,39 @@ GESTURE_COMMAND_MAP = {
 
 def detect_gesture(frame):
     try:
-        options = mp_vision.GestureRecognizerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path="gesture_recognizer.task"))
-        with mp_vision.GestureRecognizer.create_from_options(options) as r:
-            result = r.recognize(mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-        if not result.gestures: return None
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        )
+        result = gesture_recognizer.recognize(mp_image)
+        if not result.gestures:
+            return None
         top = result.gestures[0][0].category_name
-        return {"gesture":top,"command":GESTURE_COMMAND_MAP.get(top,"NONE"),"timestamp":_now_iso()}
+        return {
+            "gesture": top,
+            "command": GESTURE_COMMAND_MAP.get(top, "NONE"),
+            "timestamp": _now_iso(),
+        }
     except Exception as e:
-        print(f"⚠ Gesture: {e}"); return None
+        print(f"⚠ Gesture: {e}")
+        return None
 
+# ── Groq smoke test ──────────────────────────────────────────
+test_resp = groq_client.chat.completions.create(
+    model=GROQ_MODEL,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": 'Return only JSON: {"ok": true, "message": "groq working"}'}
+            ],
+        }
+    ],
+    timeout=GROQ_REQUEST_TIMEOUT,
+    response_format={"type": "json_object"},
+)
+
+print(test_resp.choices[0].message.content)
 
 # ══════════════════════════════════════════════════════════════
 # FULL PIPELINE
@@ -1178,11 +1190,23 @@ def run_sentinel_pipeline(frame, verbose=True, waypoint_id=None):
         "gesture":           gesture,
         "rover_command":     rover_command,
         "all_threats":       all_threats,
+        "threat_summary": [
+            {
+                "threat_type": t.get("threat_type", "unknown"),
+                "severity": t.get("severity", "unknown"),
+                "danger_score": t.get("danger_score", 0),
+                "source": t.get("source", "?"),
+                "description": t.get("specific_description", ""),
+                "bbox": t.get("bbox", {"x":0,"y":0,"w":0,"h":0}),
+            }
+            for t in all_threats
+        ],
         "qml_waypoints":     get_waypoints_for_qml(),
         "scene_summary":     scene_summary,
         "all_candidates":    all_candidates,
         "pipeline_time_s":   total_time,
     }
+
 
     print(f"\n{'='*62}")
     print(f"COMPLETE — {total_time}s | threats={len(all_threats)} | "
@@ -1232,6 +1256,13 @@ def draw_rich_overlay(frame, output):
                 f"confirmed={len(output['all_threats'])} rejected={output['rejected_count']}",
                 (8,frame.shape[0]-10),cv2.FONT_HERSHEY_SIMPLEX,0.38,(180,180,180),1)
     return out
+def save_debug_image(frame, output, prefix="debug"):
+    annotated = draw_rich_overlay(frame, output)
+    out_path = OUTPUT_DIR / f"{prefix}_frame_{output['frame']:06d}.jpg"
+    cv2.imwrite(str(out_path), annotated)
+
+    print(f"\n🖼 Debug image saved: {out_path}")
+    return out_path
 
 def display_results(frame, output):
     annotated = draw_rich_overlay(frame, output)
@@ -1277,6 +1308,28 @@ def print_rejection_log():
     for r in rejection_log:
         print(f"\n  Frame {r['frame']} | [{r['candidate_source']}] {r['yolo_class']}")
         print(f"  Reason: {r['rejection_reason'][:120]}")
+def print_final_threat_summary(output):
+    print(f"\n{'='*62}")
+    print("FINAL IDENTIFIED THREATS")
+    print(f"{'='*62}")
+
+    threats = output.get("all_threats", [])
+    if not threats:
+        print("No confirmed threats.")
+        return
+
+    for i, t in enumerate(threats, 1):
+        bbox = t.get("bbox", {})
+        print(
+            f"{i}. "
+            f"type={t.get('threat_type', 'unknown')} | "
+            f"level={t.get('severity', 'unknown').upper()} | "
+            f"score={t.get('danger_score', '?')}/10 | "
+            f"source={t.get('source', '?')} | "
+            f"bbox=({bbox.get('x',0)}, {bbox.get('y',0)}, {bbox.get('w',0)}, {bbox.get('h',0)})"
+        )
+        print(f"   description: {t.get('specific_description', 'N/A')}")
+        print(f"   approach: {t.get('rover_approach_risk', 'N/A')}")
 
 def print_pipeline_trace(last_n=30):
     print(f"\n{'='*62}\nPIPELINE TRACE (last {last_n})\n{'='*62}")
@@ -1332,83 +1385,103 @@ def print_session_stats():
 # ============================================================
 
 # ── CELL 13: Loop configuration ──────────────────────────────
-import zipfile, os, glob
+FRAME_SKIP = 3
+MAX_FRAMES = 0
+DISPLAY_EVERY_N = 10
+SUMMARY_EVERY_N = 20
+SAVE_ANNOTATED = False
+SAVE_PROMOTED_FRAMES = False
 
-FRAME_SKIP       = 3      # video only: process every Nth raw frame (1 = every frame)
-MAX_FRAMES       = 0      # 0 = unlimited; set e.g. 100 for quick test
-DISPLAY_EVERY_N  = 10     # show annotated image every N processed frames (0 = never)
-SUMMARY_EVERY_N  = 20     # print threat summary every N processed frames (0 = never)
-SAVE_ANNOTATED   = True   # write annotated frames to /content/sentinel_output/
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs" / "annotated"
+PROMOTED_OUTPUT_DIR = BASE_DIR / "outputs" / "promoted"
 
-OUTPUT_DIR = "/content/sentinel_output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+if SAVE_ANNOTATED:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+if SAVE_PROMOTED_FRAMES:
+    PROMOTED_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("✅ Loop config set.")
 print(f"   FRAME_SKIP={FRAME_SKIP} | MAX_FRAMES={MAX_FRAMES} | "
       f"DISPLAY_EVERY_N={DISPLAY_EVERY_N} | SAVE_ANNOTATED={SAVE_ANNOTATED}")
 
 
+
 # ── CELL 14: Input loader ─────────────────────────────────────
 
-def load_input():
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run SENTINEL locally.")
+    parser.add_argument("--image", type=str, default=None, help="Path to a single image")
+    parser.add_argument("--video", type=str, default=None, help="Path to a video file")
+    parser.add_argument("--zip", dest="zip_path", type=str, default=None, help="Path to a zip of images")
+    parser.add_argument("--stream-url", type=str, default=None, help="IP camera / DroidCam URL")
+    parser.add_argument("--camera", type=int, default=None, help="Local camera index, e.g. 0")
+    parser.add_argument("--waypoint-id", type=str, default=None, help="Optional waypoint id")
+    return parser.parse_args()
+
+
+def load_input(args):
     """
-    Upload a video, zip of images, or single image.
+    Local input loader.
     Returns an iterator of (frame_index, bgr_frame) tuples.
     """
-    print("\nUpload a video (.mp4/.avi/.mov), zip of images, or single image:")
-    uploaded = files.upload()
-    if not uploaded:
-        print("❌ No file uploaded.")
-        return None, None
 
-    filename = list(uploaded.keys())[0]
-    ext      = os.path.splitext(filename)[1].lower()
-    print(f"✅ Received: {filename} ({ext})")
+    selected = [x is not None for x in [args.image, args.video, args.zip_path, args.stream_url, args.camera]]
+    if sum(selected) != 1:
+        raise ValueError("Provide exactly one of --image, --video, --zip, --stream-url, or --camera")
 
-    if ext in ('.mp4', '.avi', '.mov', '.mkv'):
+    if args.video:
+        filename = args.video
         cap = cv2.VideoCapture(filename)
         if not cap.isOpened():
-            print(f"❌ Could not open video: {filename}")
-            return None, None
+            raise ValueError(f"Could not open video: {filename}")
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps          = cap.get(cv2.CAP_PROP_FPS)
-        w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"   Video: {total_frames} frames @ {fps:.1f}fps | {w}×{h}")
-        effective = total_frames // FRAME_SKIP
-        if MAX_FRAMES: effective = min(effective, MAX_FRAMES)
-        print(f"   Will process ~{effective} frames (every {FRAME_SKIP})")
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"✅ Video: {filename}")
+        print(f"   {total_frames} frames @ {fps:.1f}fps | {w}x{h}")
 
         def video_iter():
             raw_idx = 0
             processed = 0
             while True:
                 ret, frame = cap.read()
-                if not ret: break
+                if not ret:
+                    break
                 raw_idx += 1
-                if raw_idx % FRAME_SKIP != 0: continue
+                if raw_idx % FRAME_SKIP != 0:
+                    continue
                 processed += 1
                 yield raw_idx, frame
-                if MAX_FRAMES and processed >= MAX_FRAMES: break
+                if MAX_FRAMES and processed >= MAX_FRAMES:
+                    break
             cap.release()
 
         return video_iter(), "video"
 
-    elif ext == '.zip':
-        extract_dir = "/content/sentinel_frames"
-        os.makedirs(extract_dir, exist_ok=True)
-        with zipfile.ZipFile(filename, 'r') as z:
+    if args.zip_path:
+        extract_dir = BASE_DIR / "temp_frames"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(args.zip_path, "r") as z:
             z.extractall(extract_dir)
-        exts  = ('*.jpg','*.jpeg','*.png','*.bmp','*.webp')
+
+        exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
         paths = []
         for e in exts:
-            paths.extend(glob.glob(os.path.join(extract_dir, '**', e), recursive=True))
+            paths.extend(glob.glob(str(extract_dir / "**" / e), recursive=True))
         paths.sort()
+
         if not paths:
-            print("❌ No images found in zip.")
-            return None, None
-        if MAX_FRAMES: paths = paths[:MAX_FRAMES]
-        print(f"   Found {len(paths)} images in zip")
+            raise ValueError("No images found in zip.")
+
+        if MAX_FRAMES:
+            paths = paths[:MAX_FRAMES]
+
+        print(f"✅ Zip: {args.zip_path}")
+        print(f"   Found {len(paths)} images")
 
         def zip_iter():
             for idx, path in enumerate(paths):
@@ -1420,27 +1493,80 @@ def load_input():
 
         return zip_iter(), "zip"
 
-    else:
-        frame = cv2.imread(filename)
+    if args.image:
+        frame = cv2.imread(args.image)
         if frame is None:
-            print(f"❌ Could not read image: {filename}")
-            return None, None
-        print(f"   Single image: {frame.shape[1]}×{frame.shape[0]}")
+            raise ValueError(f"Could not read image: {args.image}")
+        print(f"✅ Image: {args.image}")
+        print(f"   {frame.shape[1]}x{frame.shape[0]}")
 
         def single_iter():
             yield 0, frame
 
         return single_iter(), "single"
 
+    if args.stream_url:
+        cap = cv2.VideoCapture(args.stream_url)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open stream URL: {args.stream_url}")
+
+        print(f"✅ Stream URL: {args.stream_url}")
+
+        def stream_iter():
+            raw_idx = 0
+            processed = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                raw_idx += 1
+                if raw_idx % FRAME_SKIP != 0:
+                    continue
+                processed += 1
+                yield raw_idx, frame
+                if MAX_FRAMES and processed >= MAX_FRAMES:
+                    break
+            cap.release()
+
+        return stream_iter(), "stream"
+
+    if args.camera is not None:
+        cap = cv2.VideoCapture(args.camera)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open camera index: {args.camera}")
+
+        print(f"✅ Camera index: {args.camera}")
+
+        def camera_iter():
+            raw_idx = 0
+            processed = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                raw_idx += 1
+                if raw_idx % FRAME_SKIP != 0:
+                    continue
+                processed += 1
+                yield raw_idx, frame
+                if MAX_FRAMES and processed >= MAX_FRAMES:
+                    break
+            cap.release()
+
+        return camera_iter(), "camera"
+
+    raise ValueError("No valid input source provided.")
+
+
 
 # ── CELL 15: Main loop ────────────────────────────────────────
 
-def run_loop():
+def run_loop(args):
     """
     Multi-frame processing loop for video, zip, or single image.
     DroidCam live stream: use run_droidcam_stream() in CELL 16 instead.
     """
-    frame_iter, input_type = load_input()
+    frame_iter, input_type = load_input(args)
     if frame_iter is None:
         return
 
@@ -1463,6 +1589,8 @@ def run_loop():
         t_frame = time.time()
 
         output = run_sentinel_pipeline(frame, verbose=False)
+        print_final_threat_summary(output)
+        save_debug_image(frame, output, prefix="loop")
 
         recent_traces = [e for e in pipeline_trace if e["frame"] == frame_count]
         groq_trace    = [e for e in recent_traces if e["stage"] == "GROQ"]
@@ -1518,7 +1646,8 @@ def run_loop():
 
         if SAVE_ANNOTATED:
             annotated = draw_rich_overlay(frame, output)
-            cv2.imwrite(os.path.join(OUTPUT_DIR, f"frame_{frame_count:06d}.jpg"), annotated)
+            cv2.imwrite(str(OUTPUT_DIR / f"frame_{frame_count:06d}.jpg"), annotated)
+
 
         if SUMMARY_EVERY_N and processed_count % SUMMARY_EVERY_N == 0:
             elapsed  = round(time.time() - loop_start, 1)
@@ -1599,7 +1728,7 @@ DROIDCAM_PROCESS_EVERY_N_FRAMES = 6  # pipeline runs on every 6th raw frame
 DROIDCAM_MAX_PIPELINE_FRAMES = 0     # 0 = run until interrupted
                                      # set e.g. 300 to auto-stop after 300 processed
 DROIDCAM_DISPLAY_EVERY_N     = 15    # show annotated frame in Colab every N processed
-DROIDCAM_SAVE_ANNOTATED      = True  # save annotated frames to OUTPUT_DIR
+DROIDCAM_SAVE_ANNOTATED      = False  # save annotated frames to OUTPUT_DIR
 
 
 def run_droidcam_stream(waypoint_id=None):
@@ -1707,10 +1836,8 @@ def run_droidcam_stream(waypoint_id=None):
             # ── Save annotated frame ──────────────────────────
             if DROIDCAM_SAVE_ANNOTATED:
                 annotated = draw_rich_overlay(frame, output)
-                cv2.imwrite(
-                    os.path.join(OUTPUT_DIR, f"droidcam_{frame_count:06d}.jpg"),
-                    annotated
-                )
+                cv2.imwrite(str(OUTPUT_DIR / f"droidcam_{frame_count:06d}.jpg"), annotated)
+
 
             # ── Session cap reached — stop gracefully ─────────
             if GROQ_SESSION_CAP and groq_call_count >= GROQ_SESSION_CAP:
@@ -1748,6 +1875,825 @@ def run_droidcam_stream(waypoint_id=None):
                   f"{wp.get('specific_description','')[:55]}")
         print_session_stats()
 
+# ============================================================
+# SENTINEL v6 PATCH 2 — CURRENT-EVENT FRAME SELECTION
+# + SCENE-LEVEL THREAT FALLBACK
+# + FIRE-SCENE SYNTHETIC CANDIDATE
+# Paste this as ONE cell after your current notebook code.
+# ============================================================
+
+import os
+import cv2
+import json
+import time
+import base64
+import math
+from collections import deque
+
+# ------------------------------------------------------------
+# Added tuning variables
+# ------------------------------------------------------------
+FRAME_SELECTION_LOOKBACK = 3          # only look back a few recent frames for the same event
+SCENE_DANGER_THRESHOLD   = 5          # scene-level Groq fallback emit threshold
+SCENE_DANGER_ENVS        = {"active_threat_zone", "structural_hazard", "rescue_needed"}
+
+# Fire-scene synthesis thresholds
+FIRE_SCENE_ENABLE                     = True
+FIRE_STRUCTURAL_MIN_DIAGONALS         = 12
+FIRE_STRUCTURAL_MIN_IRREG_CONTOURS    = 80
+FIRE_STRUCTURAL_MIN_BURN_RATIO        = 0.015
+FIRE_MOTION_CONFIRM_FILL              = 0.08
+FIRE_SCENE_MIN_SCORE                  = 1.0
+
+# Debug
+DEBUG_SCENE_FALLBACK = True
+
+# Ensure promoted dir exists
+PROMOTED_OUTPUT_DIR = globals().get("PROMOTED_OUTPUT_DIR", BASE_DIR / "outputs" / "promoted")
+if SAVE_PROMOTED_FRAMES:
+    Path(PROMOTED_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+
+if "promoted_frame_log" not in globals():
+    promoted_frame_log = []
+if "selected_frame_count" not in globals():
+    selected_frame_count = 0
+
+# ------------------------------------------------------------
+# Replacement frame selector
+# Key fix: only select from CURRENT event window, not from old history
+# ------------------------------------------------------------
+class FrameSelector:
+    def __init__(self):
+        self.buffer = deque(maxlen=FRAME_BUFFER_SIZE if "FRAME_BUFFER_SIZE" in globals() else 12)
+        self.last_promoted_frame = -999
+        self.event_memory = {}
+        self.last_heartbeat_frame = -999
+
+    def _sharpness(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _bbox_area_ratio(self, bbox, frame_w, frame_h):
+        if not bbox:
+            return 0.0
+        area = max(0, bbox.get("w", 0)) * max(0, bbox.get("h", 0))
+        return area / max(1, frame_w * frame_h)
+
+    def _center_bias(self, bbox, frame_w, frame_h):
+        if not bbox:
+            return 0.0
+        cx = bbox.get("x", 0) + bbox.get("w", 0) / 2
+        cy = bbox.get("y", 0) + bbox.get("h", 0) / 2
+        dx = abs(cx - frame_w / 2) / max(1, frame_w / 2)
+        dy = abs(cy - frame_h / 2) / max(1, frame_h / 2)
+        return max(0.0, 1.0 - (dx + dy) / 2)
+
+    def _candidate_event_key(self, c, frame_w, frame_h):
+        bbox = c.get("bbox", {})
+        cx = bbox.get("x", 0) + bbox.get("w", 0) / 2
+        cy = bbox.get("y", 0) + bbox.get("h", 0) / 2
+        gx = int(cx / max(1, frame_w) * GRID_CELLS_X)
+        gy = int(cy / max(1, frame_h) * GRID_CELLS_Y)
+        gx = min(max(gx, 0), GRID_CELLS_X - 1)
+        gy = min(max(gy, 0), GRID_CELLS_Y - 1)
+        return (c.get("candidate_source", "?"), c.get("yolo_class", "?"), gx, gy)
+
+    def _update_event_memory(self, candidates, frame_w, frame_h):
+        ttl = EVENT_TTL_FRAMES if "EVENT_TTL_FRAMES" in globals() else 12
+        stale = [k for k, v in self.event_memory.items() if frame_count - v["last_frame"] > ttl]
+        for k in stale:
+            del self.event_memory[k]
+
+        for c in candidates:
+            key = self._candidate_event_key(c, frame_w, frame_h)
+            if key not in self.event_memory:
+                self.event_memory[key] = {"count": 0, "last_frame": frame_count}
+            self.event_memory[key]["count"] += 1
+            self.event_memory[key]["last_frame"] = frame_count
+
+    def _candidate_score(self, c, frame_w, frame_h):
+        bbox = c.get("bbox", {})
+        src = c.get("candidate_source", "yolo")
+        base = PROMOTION_SOURCE_WEIGHTS.get(src, 1.0) if "PROMOTION_SOURCE_WEIGHTS" in globals() else 1.0
+        conf = float(c.get("confidence", 0.5))
+        anomaly = float(c.get("anomaly_score", 0.0))
+        area = self._bbox_area_ratio(bbox, frame_w, frame_h)
+        center = self._center_bias(bbox, frame_w, frame_h)
+
+        score = base + conf + anomaly
+        score += (BBOX_AREA_WEIGHT if "BBOX_AREA_WEIGHT" in globals() else 1.2) * area
+        score += (CENTER_BIAS_WEIGHT if "CENTER_BIAS_WEIGHT" in globals() else 0.35) * center
+
+        posture = c.get("posture", "")
+        if any(p in posture for p in ("prone", "fallen", "collapsed", "crawling")):
+            score += 1.2
+        if c.get("yolo_class") in ("knife", "scissors", "baseball bat"):
+            score += 0.8
+        if c.get("candidate_source") == "scene_fire":
+            score += 2.0
+        return score
+
+    def _snapshot_score(self, frame, candidates, nav_hazards, scene_summary, delta_score):
+        frame_h, frame_w = frame.shape[:2]
+        sharpness = self._sharpness(frame)
+
+        candidate_scores = []
+        persistence_min = EVENT_MIN_PERSISTENCE if "EVENT_MIN_PERSISTENCE" in globals() else 2
+        for c in candidates:
+            cscore = self._candidate_score(c, frame_w, frame_h)
+            key = self._candidate_event_key(c, frame_w, frame_h)
+            persistence = self.event_memory.get(key, {}).get("count", 1)
+            if persistence >= persistence_min:
+                cscore += 0.5
+            candidate_scores.append(cscore)
+
+        nav_bonus = 1.5 * len(nav_hazards)
+        cls_bonus = 0.15 * len(scene_summary.get("detected_classes", []))
+        best_candidate = max(candidate_scores) if candidate_scores else 0.0
+        total = best_candidate + nav_bonus + cls_bonus + float(delta_score)
+
+        sharp_min = SHARPNESS_MIN if "SHARPNESS_MIN" in globals() else 40.0
+        sharp_w = SHARPNESS_WEIGHT if "SHARPNESS_WEIGHT" in globals() else 0.015
+        total += max(0.0, sharpness - sharp_min) * sharp_w
+
+        return {
+            "score": round(total, 3),
+            "sharpness": round(sharpness, 2),
+            "best_candidate_score": round(best_candidate, 3),
+        }
+
+    def add_snapshot(self, frame, candidates, nav_hazards, scene_summary, delta_score, delta_reasons, waypoint_id):
+        frame_h, frame_w = frame.shape[:2]
+        self._update_event_memory(candidates, frame_w, frame_h)
+        scored = self._snapshot_score(frame, candidates, nav_hazards, scene_summary, delta_score)
+
+        snap = {
+            "frame_id": frame_count,
+            "timestamp": _now_iso(),
+            "frame": frame.copy(),
+            "candidates": [dict(c) for c in candidates],
+            "nav_hazards": [dict(h) for h in nav_hazards],
+            "scene_summary": dict(scene_summary),
+            "delta_score": delta_score,
+            "delta_reasons": list(delta_reasons),
+            "waypoint_id": waypoint_id,
+            "score": scored["score"],
+            "sharpness": scored["sharpness"],
+            "best_candidate_score": scored["best_candidate_score"],
+        }
+        self.buffer.append(snap)
+        return snap
+
+    def should_promote(self, snapshot, should_call_scene_gate):
+        reasons = []
+        if not globals().get("FRAME_SELECTOR_ENABLED", True):
+            return True, ["selector_disabled"]
+
+        cooldown = globals().get("PROMOTION_MIN_FRAMES_BETWEEN", 6)
+        frames_since_last = frame_count - self.last_promoted_frame
+        if frames_since_last < cooldown:
+            return False, [f"promotion_cooldown:{frames_since_last}/{cooldown}"]
+
+        if snapshot["nav_hazards"]:
+            reasons.append("nav_hazard")
+        if should_call_scene_gate:
+            reasons.append("scene_delta")
+
+        min_score = globals().get("FRAME_PROMOTION_MIN_SCORE", 2.2)
+        if snapshot["score"] >= min_score:
+            reasons.append(f"score:{snapshot['score']}")
+
+        heartbeat = globals().get("PROMOTION_HEARTBEAT_FRAMES", 45)
+        if frame_count - self.last_heartbeat_frame >= heartbeat and snapshot["score"] >= 1.2:
+            reasons.append("heartbeat")
+
+        return bool(reasons), reasons
+
+    def select_best_snapshot(self, anchor_frame_id):
+        # Critical fix: choose only from the current event neighborhood, never a stale frame
+        recent = [
+            s for s in self.buffer
+            if anchor_frame_id - FRAME_SELECTION_LOOKBACK <= s["frame_id"] <= anchor_frame_id
+        ]
+        if not recent:
+            recent = [s for s in self.buffer if s["frame_id"] == anchor_frame_id]
+        if not recent:
+            return None
+
+        best = None
+        best_value = -1e9
+        sharp_min = globals().get("SHARPNESS_MIN", 40.0)
+        sharp_w = globals().get("SHARPNESS_WEIGHT", 0.015)
+
+        for snap in recent:
+            value = snap["score"]
+            value += max(0.0, snap["sharpness"] - sharp_min) * sharp_w
+            if value > best_value:
+                best_value = value
+                best = snap
+        return best
+
+    def mark_promoted(self, snapshot, reasons):
+        global selected_frame_count
+        self.last_promoted_frame = frame_count
+        self.last_heartbeat_frame = frame_count
+        selected_frame_count += 1
+
+        promoted_frame_log.append({
+            "frame_id": snapshot["frame_id"],
+            "timestamp": snapshot["timestamp"],
+            "score": snapshot["score"],
+            "sharpness": snapshot["sharpness"],
+            "delta_score": snapshot["delta_score"],
+            "delta_reasons": snapshot["delta_reasons"],
+            "promotion_reasons": reasons,
+            "candidate_count": len(snapshot["candidates"]),
+            "waypoint_id": snapshot["waypoint_id"],
+        })
+
+        if globals().get("DEBUG_FRAME_SELECTOR", True):
+            print(f"\n🎯 FRAME PROMOTED → frame={snapshot['frame_id']} "
+                  f"| score={snapshot['score']} | sharpness={snapshot['sharpness']} "
+                  f"| reasons={reasons}")
+
+frame_selector = FrameSelector()
+
+# ------------------------------------------------------------
+# Synthetic fire-scene candidate
+# ------------------------------------------------------------
+def generate_scene_fire_candidate(frame, scene_summary, hsv_candidates, struct_candidate, motion_candidate):
+    """
+    Build a more specific candidate for scenes with fire / burning vehicle / explosion-like cues
+    even when YOLO has no object class for the threat.
+    """
+    if not FIRE_SCENE_ENABLE:
+        return None
+
+    frame_h, frame_w = frame.shape[:2]
+    score = 0.0
+    reasons = []
+
+    # Explicit HSV cues
+    hsv_fire = [c for c in hsv_candidates if c.get("candidate_source") == "hsv_fire"]
+    hsv_smoke = [c for c in hsv_candidates if c.get("candidate_source") == "hsv_smoke"]
+
+    if hsv_fire:
+        score += 2.5
+        reasons.append("hsv_fire")
+    if hsv_smoke:
+        score += 1.5
+        reasons.append("hsv_smoke")
+
+    # Structural cues from burning wreckage / blast / debris silhouettes
+    if struct_candidate:
+        if struct_candidate.get("diagonal_lines", 0) >= FIRE_STRUCTURAL_MIN_DIAGONALS:
+            score += 0.8
+            reasons.append("diag_lines")
+        if struct_candidate.get("irregular_contours", 0) >= FIRE_STRUCTURAL_MIN_IRREG_CONTOURS:
+            score += 0.8
+            reasons.append("irregular_contours")
+        if struct_candidate.get("burn_ratio", 0.0) >= FIRE_STRUCTURAL_MIN_BURN_RATIO:
+            score += 1.0
+            reasons.append("burn_ratio")
+        if struct_candidate.get("anomaly_score", 0.0) >= 0.9:
+            score += 0.7
+            reasons.append("structural_anomaly")
+
+    # Motion around flames/smoke plume
+    if motion_candidate and motion_candidate.get("motion_fill_pct", 0) >= FIRE_MOTION_CONFIRM_FILL:
+        score += 0.5
+        reasons.append("motion")
+
+    if score < FIRE_SCENE_MIN_SCORE:
+        return None
+
+    # Prefer actual fire bbox if present, otherwise use upper scene / structural bbox
+    if hsv_fire:
+        primary_bbox = hsv_fire[0]["bbox"]
+        region = hsv_fire[0].get("frame_region", "center")
+        v_zone = hsv_fire[0].get("vertical_zone", "upper")
+        distance = hsv_fire[0].get("relative_distance", "mid")
+    elif struct_candidate:
+        primary_bbox = struct_candidate["bbox"]
+        region = struct_candidate.get("frame_region", "upper_zone")
+        v_zone = struct_candidate.get("vertical_zone", "upper")
+        distance = struct_candidate.get("relative_distance", "far")
+    else:
+        primary_bbox = {"x": 0, "y": 0, "w": frame_w, "h": frame_h}
+        region = "full_scene"
+        v_zone = "full"
+        distance = "far"
+
+    return {
+        "candidate_source": "scene_fire",
+        "yolo_class": "vehicle_fire_candidate",
+        "confidence": round(min(0.99, 0.45 + score / 6.0), 2),
+        "bbox": primary_bbox,
+        "frame_region": region,
+        "vertical_zone": v_zone,
+        "relative_distance": distance,
+        "posture": "n/a",
+        "anomaly_score": round(min(1.0, score / 4.0), 2),
+        "scene_fire_score": round(score, 2),
+        "scene_fire_reasons": reasons,
+        "shape_note": "scene_level_fire_or_burning_vehicle_candidate",
+    }
+
+# ------------------------------------------------------------
+# Scene-level fallback emitter
+# ------------------------------------------------------------
+def build_scene_level_threat(parsed, frame, selected_snapshot, promote_reasons):
+    frame_h, frame_w = frame.shape[:2]
+    score = int(parsed.get("overall_danger_score", 0))
+    env = parsed.get("environment_assessment", "unknown")
+    desc = parsed.get("scene_description", "") or parsed.get("operator_summary", "") or "Scene-level hazard detected"
+
+    if score < SCENE_DANGER_THRESHOLD and env not in SCENE_DANGER_ENVS:
+        return None
+
+    severity = "critical" if score >= 8 else "high" if score >= 6 else "medium"
+
+    subject_type = "structural_damage"
+    desc_lower = desc.lower()
+    if "fire" in desc_lower or "burn" in desc_lower or "smoke" in desc_lower:
+        subject_type = "fire"
+    elif "armed" in desc_lower or "hostile" in desc_lower or "combat" in desc_lower:
+        subject_type = "hostile_threat"
+    elif "injured" in desc_lower or "survivor" in desc_lower or "casualty" in desc_lower:
+        subject_type = "survivor_injured"
+
+    if DEBUG_SCENE_FALLBACK:
+        print(f"   [SCENE FALLBACK] Emitting scene-level threat | env={env} | score={score}")
+
+    return {
+        "threat_type": "scene_level_hazard",
+        "specific_description": desc,
+        "subject_type": subject_type,
+        "threat_confirmed": True,
+        "category": "groq_scene_validated",
+        "danger_score": max(score, SCENE_DANGER_THRESHOLD),
+        "severity": severity,
+        "confidence": 0.85,
+        "groq_reasoning": parsed.get("operator_summary", "") or desc,
+        "key_indicators": [
+            f"environment={env}",
+            f"overall_danger={score}",
+            *([f"promotion={r}" for r in promote_reasons[:3]] if promote_reasons else [])
+        ],
+        "recommended_action": "stop" if score >= 7 else "reroute",
+        "rover_approach_risk": "do_not_approach" if score >= 7 else "approach_with_caution",
+        "scene_description": parsed.get("scene_description", ""),
+        "operator_summary": parsed.get("operator_summary", ""),
+        "environment": env,
+        "frame_region": "full_scene",
+        "vertical_zone": "full",
+        "relative_distance": "unknown",
+        "posture": "n/a",
+        "anomaly_score": 1.0,
+        "source": "groq_scene",
+        "persistent": True,
+        "bbox": {"x": 0, "y": 0, "w": frame_w, "h": frame_h},
+        "timestamp": _now_iso(),
+        "rover_position": {"x": 0.0, "y": 0.0},
+        "selected_frame_id": selected_snapshot["frame_id"],
+        "promotion_reasons": promote_reasons,
+    }
+
+# ------------------------------------------------------------
+# Helper: promoted frame debug
+# ------------------------------------------------------------
+def save_promoted_frame_debug(snapshot, prefix="promoted"):
+    annotated = draw_rich_overlay(
+        snapshot["frame"],
+        {
+            "frame": snapshot["frame_id"],
+            "all_candidates": snapshot["candidates"],
+            "all_threats": snapshot["nav_hazards"],
+            "rejected_count": 0,
+            "rover_command": rover_command,
+        }
+    )
+    out_path = PROMOTED_OUTPUT_DIR / f"{prefix}_frame_{snapshot['frame_id']:06d}.jpg"
+    cv2.imwrite(str(out_path), annotated)
+
+    print(f"🎯 Promoted frame debug saved: {out_path}")
+    return out_path
+
+# ------------------------------------------------------------
+# Replacement assess_all_candidates
+# ------------------------------------------------------------
+def assess_all_candidates(frame, all_candidates, scene_summary, nav_hazards=None, waypoint_id=None):
+    global last_groq_call, groq_call_count, last_groq_frame
+
+    if nav_hazards is None:
+        nav_hazards = []
+
+    frame_h, frame_w = frame.shape[:2]
+
+    if not all_candidates:
+        _trace("GROQ", "No candidates — skip")
+        return [], []
+
+    all_candidates = object_tracker.iou_deduplicate(all_candidates)
+
+    all_candidates, suppressed_count = object_tracker.filter_known(
+        all_candidates, frame_w, frame_h
+    )
+    if suppressed_count:
+        _trace("TRACKER", f"Suppressed {suppressed_count} known objects")
+
+    if not all_candidates:
+        _trace("GROQ", "All candidates suppressed by tracker — skip")
+        return [], []
+
+    should_call, delta_score, delta_reasons = scene_change_detector.compute_delta(
+        all_candidates, frame_w, frame_h
+    )
+
+    snapshot = frame_selector.add_snapshot(
+        frame=frame,
+        candidates=all_candidates,
+        nav_hazards=nav_hazards,
+        scene_summary=scene_summary,
+        delta_score=delta_score,
+        delta_reasons=delta_reasons,
+        waypoint_id=waypoint_id or current_waypoint_id,
+    )
+
+    promote, promote_reasons = frame_selector.should_promote(snapshot, should_call)
+    if not promote:
+        _trace("FRAME_SELECTOR", f"Not promoted | score={snapshot['score']} reasons={promote_reasons}")
+        if globals().get("DEBUG_FRAME_SELECTOR", True):
+            print(f"\n   [FRAME SELECTOR] SKIP | score={snapshot['score']} | reasons={promote_reasons}")
+        return [], []
+
+    # Critical fix: anchor to the CURRENT triggering frame
+    selected_snapshot = frame_selector.select_best_snapshot(anchor_frame_id=snapshot["frame_id"])
+    if selected_snapshot is None:
+        selected_snapshot = snapshot
+
+    frame_selector.mark_promoted(selected_snapshot, promote_reasons)
+    if globals().get("SAVE_PROMOTED_FRAMES", True):
+        save_promoted_frame_debug(selected_snapshot)
+
+    selected_frame = selected_snapshot["frame"]
+    selected_candidates = selected_snapshot["candidates"]
+    selected_scene_summary = selected_snapshot["scene_summary"]
+
+    now = time.time()
+    rate_ok = (now - last_groq_call) >= GROQ_MIN_INTERVAL
+    if not rate_ok:
+        wait = round(GROQ_MIN_INTERVAL - (now - last_groq_call), 1)
+        _trace("GROQ", f"Rate limited — {wait}s remaining")
+        print(f"   [GROQ] Rate limit — {wait}s to next call")
+        return _fallback_unverified(selected_candidates), []
+
+    last_groq_call = now
+    last_groq_frame = frame_count
+    groq_call_count += 1
+
+    t_start = time.time()
+    _trace("GROQ", f"Calling Groq on promoted frame {selected_snapshot['frame_id']} "
+                   f"| candidates={len(selected_candidates)} | reasons={promote_reasons}")
+
+    print(f"\n{'─'*55}")
+    print(f"🤖 GROQ CALL #{groq_call_count}"
+          + (f"/{GROQ_SESSION_CAP}" if GROQ_SESSION_CAP else "")
+          + f" — promoted frame {selected_snapshot['frame_id']} "
+          + f"({len(selected_candidates)} candidates)")
+    for c in selected_candidates:
+        print(f"   → [{c['candidate_source']}] {c['yolo_class']} "
+              f"| anomaly={c.get('anomaly_score', 0)}")
+
+    try:
+        def _candidate_text_desc(c):
+            parts = [
+                f"class={c['yolo_class']}",
+                f"source={c['candidate_source']}",
+                f"confidence={c.get('confidence', '?')}",
+                f"region={c.get('frame_region', '?')}",
+                f"vertical_zone={c.get('vertical_zone', '?')}",
+                f"distance={c.get('relative_distance', '?')}",
+                f"anomaly_score={c.get('anomaly_score', '?')}",
+            ]
+            if c.get("posture") and c["posture"] != "n/a":
+                parts.append(f"posture={c['posture']}")
+            if c.get("shape_note"):
+                parts.append(f"shape_note={c['shape_note']}")
+            if c.get("shape_circularity") is not None:
+                parts.append(f"circularity={c['shape_circularity']}")
+            if c.get("coverage_percent") is not None:
+                parts.append(f"coverage={c['coverage_percent']}%")
+            if c.get("motion_fill_pct") is not None:
+                parts.append(f"motion_fill={c['motion_fill_pct']}%")
+            if c.get("upper_edge_density") is not None:
+                parts.append(f"upper_edge_density={c['upper_edge_density']}")
+            if c.get("scene_fire_reasons"):
+                parts.append(f"scene_fire_reasons={','.join(c['scene_fire_reasons'])}")
+            return " | ".join(parts)
+
+        candidates_with_desc = []
+        for c in selected_candidates:
+            augmented = dict(c)
+            augmented["_text_description"] = _candidate_text_desc(c)
+            candidates_with_desc.append(augmented)
+
+        prompt = SENTINEL_UNIFIED_PROMPT.format(
+            candidates_json=json.dumps(candidates_with_desc, indent=2),
+            scene_context=json.dumps({
+                "crowd_density": selected_scene_summary.get("crowd_density"),
+                "detected_classes": selected_scene_summary.get("detected_classes", []),
+                "environment_tags": selected_scene_summary.get("environment_tags", []),
+            }, indent=2)
+        )
+
+        if DEBUG_GROQ_PROMPT:
+            print(f"\n[GROQ PROMPT — {len(prompt)} chars]\n{prompt[:800]}...\n")
+
+        _, buffer = cv2.imencode(".jpg", selected_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        b64_image = base64.b64encode(buffer.tobytes()).decode("utf-8")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                    },
+                ],
+            }
+        ]
+
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            timeout=GROQ_REQUEST_TIMEOUT,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+        if DEBUG_GROQ_RAW:
+            print(f"\n[GROQ RAW]\n{raw[:600]}{'...' if len(raw) > 600 else ''}\n")
+
+        elapsed = round(time.time() - t_start, 2)
+        parsed = json.loads(raw)
+
+        if DEBUG_STAGE_TIMINGS:
+            print(f"   ⏱ Groq: {elapsed}s | prompt ~{len(prompt)//4} tokens")
+
+        scene_change_detector.mark_validated(selected_candidates, frame_w, frame_h)
+        object_tracker.mark_validated(selected_candidates, frame_w, frame_h)
+
+        confirmed_threats = []
+        rejected = []
+
+        print(f"\n🤖 GROQ VERDICTS:")
+        for a in parsed.get("assessments", []):
+            is_confirmed = a.get("confirmed", False)
+            danger_score = a.get("danger_score", 0)
+            subject_type = a.get("subject_type", "")
+            source = a.get("candidate_source", "?")
+            cls = a.get("yolo_class", "?")
+
+            tag = next(
+                (c for c in selected_candidates
+                 if c.get("yolo_class") == cls and c.get("candidate_source") == source),
+                {}
+            )
+
+            if not is_confirmed:
+                entry = {
+                    "frame": frame_count,
+                    "candidate_source": source,
+                    "yolo_class": cls,
+                    "rejection_reason": a.get("rejection_reason", ""),
+                    "reasoning": a.get("reasoning", ""),
+                }
+                rejected.append(entry)
+                rejection_log.append(entry)
+                print(f"   ❌ REJECTED [{source}] {cls} — {a.get('rejection_reason', '')[:80]}")
+                _trace("GROQ_REJECT", f"Rejected {cls}")
+                continue
+
+            if danger_score < DANGER_THRESHOLD and "survivor" not in subject_type:
+                print(f"   ⬇ BELOW THRESHOLD [{source}] {cls} score={danger_score}")
+                continue
+
+            print(f"   ✅ CONFIRMED [{source}] {cls} → score={danger_score} | {subject_type}")
+            confirmed_threats.append({
+                "threat_type": cls,
+                "specific_description": a.get("specific_description", cls),
+                "subject_type": subject_type,
+                "threat_confirmed": True,
+                "category": "groq_validated",
+                "danger_score": danger_score,
+                "severity": a.get("severity", "low"),
+                "confidence": tag.get("confidence", 0.0),
+                "groq_reasoning": a.get("reasoning", ""),
+                "key_indicators": a.get("key_indicators", []),
+                "recommended_action": a.get("recommended_action", "log_only"),
+                "rover_approach_risk": a.get("rover_approach_risk", "approach_with_caution"),
+                "scene_description": parsed.get("scene_description", ""),
+                "operator_summary": parsed.get("operator_summary", ""),
+                "environment": parsed.get("environment_assessment", "unknown"),
+                "frame_region": tag.get("frame_region", "unknown"),
+                "vertical_zone": tag.get("vertical_zone", "unknown"),
+                "relative_distance": tag.get("relative_distance", "unknown"),
+                "posture": tag.get("posture", "n/a"),
+                "anomaly_score": tag.get("anomaly_score", 0.0),
+                "source": f"groq+{source}",
+                "persistent": True,
+                "bbox": tag.get("bbox", {"x": 0, "y": 0, "w": 0, "h": 0}),
+                "timestamp": _now_iso(),
+                "rover_position": {"x": 0.0, "y": 0.0},
+                "selected_frame_id": selected_snapshot["frame_id"],
+                "promotion_reasons": promote_reasons,
+            })
+
+        # Critical fix: emit scene-level threat if Groq says scene is dangerous
+        if not confirmed_threats:
+            scene_threat = build_scene_level_threat(
+                parsed=parsed,
+                frame=selected_frame,
+                selected_snapshot=selected_snapshot,
+                promote_reasons=promote_reasons,
+            )
+            if scene_threat is not None:
+                print("   ✅ SCENE-LEVEL THREAT EMITTED")
+                confirmed_threats.append(scene_threat)
+
+        print(f"{'─'*55}")
+        print(f"🤖 {len(confirmed_threats)} confirmed | {len(rejected)} rejected | "
+              f"overall danger={parsed.get('overall_danger_score', 0)}/10")
+        if parsed.get("operator_summary"):
+            print(f"📡 {parsed['operator_summary']}")
+
+        return confirmed_threats, rejected
+
+    except json.JSONDecodeError as e:
+        print(f"⚠ JSON parse error: {e}")
+        return _fallback_unverified(selected_candidates), []
+    except Exception as e:
+        print(f"⚠ Groq error: {e}")
+        return _fallback_unverified(selected_candidates), []
+
+# ------------------------------------------------------------
+# Replacement run_sentinel_pipeline
+# Adds synthetic fire-scene candidate
+# ------------------------------------------------------------
+def run_sentinel_pipeline(frame, verbose=True, waypoint_id=None):
+    global prev_frame_global, rover_command, frame_count
+    frame_count += 1
+    rover_command = "PROCEED"
+    t_pipeline = time.time()
+
+    if waypoint_id is not None:
+        on_waypoint_transition(waypoint_id)
+
+    print(f"\n{'='*62}")
+    print(f"SENTINEL v6 — FRAME {frame_count}" + (f" | WAYPOINT {waypoint_id}" if waypoint_id else ""))
+    print(f"{'='*62}")
+
+    t1 = time.time()
+    yolo_raw = yolo_model(frame, conf=CONF_OBJECT, imgsz=YOLO_IMGSZ, verbose=False)[0]
+
+    yolo_candidates, nav_hazards, scene_summary = generate_yolo_candidates(frame, yolo_raw)
+    hsv_candidates = generate_hsv_candidates(frame)
+    struct_candidate = generate_structural_candidate(frame)
+    motion_candidate = generate_motion_candidate(frame, prev_frame_global)
+    prev_frame_global = frame.copy()
+
+    all_candidates = yolo_candidates + hsv_candidates
+    if struct_candidate:
+        all_candidates.append(struct_candidate)
+    if motion_candidate:
+        all_candidates.append(motion_candidate)
+
+    # New: synthesize a better fire/burning-vehicle candidate when local CV is weak
+    scene_fire_candidate = generate_scene_fire_candidate(
+        frame=frame,
+        scene_summary=scene_summary,
+        hsv_candidates=hsv_candidates,
+        struct_candidate=struct_candidate,
+        motion_candidate=motion_candidate,
+    )
+    if scene_fire_candidate is not None:
+        all_candidates.append(scene_fire_candidate)
+        candidate_log.append({**scene_fire_candidate, "frame": frame_count})
+        if DEBUG_CANDIDATES:
+            print(f"\n   [SCENE FIRE → QUEUE] score={scene_fire_candidate['scene_fire_score']} "
+                  f"| reasons={scene_fire_candidate['scene_fire_reasons']}")
+
+    if DEBUG_STAGE_TIMINGS:
+        print(f"   ⏱ Stage 1 (candidates): {round(time.time() - t1, 2)}s [no k-means/Hough enrichment]")
+    print(f"\n   Stage 1: YOLO={len(yolo_candidates)} | nav={len(nav_hazards)} | "
+          f"HSV={len(hsv_candidates)} | struct={'1' if struct_candidate else '0'} | "
+          f"motion={'1' if motion_candidate else '0'} | "
+          f"scene_fire={'1' if scene_fire_candidate else '0'} | total={len(all_candidates)}")
+
+    for h in nav_hazards:
+        emit_threat(h)
+
+    t2 = time.time()
+    confirmed_threats, rejected = assess_all_candidates(
+        frame,
+        all_candidates,
+        scene_summary,
+        nav_hazards=nav_hazards,
+        waypoint_id=waypoint_id,
+    )
+
+    for t in confirmed_threats:
+        emit_threat(t)
+
+    if DEBUG_STAGE_TIMINGS:
+        print(f"   ⏱ Stage 2 (Groq): {round(time.time() - t2, 2)}s")
+
+    gesture = detect_gesture(frame)
+    if gesture:
+        print(f"\n✋ {gesture['gesture']} → {gesture['command']}")
+
+    all_threats = nav_hazards + confirmed_threats
+    total_time = round(time.time() - t_pipeline, 2)
+
+    output = {
+        "frame": frame_count,
+        "nav_hazards": nav_hazards,
+        "confirmed_threats": confirmed_threats,
+        "rejected_count": len(rejected),
+        "gesture": gesture,
+        "rover_command": rover_command,
+        "all_threats": all_threats,
+        "threat_summary": [
+            {
+                "threat_type": t.get("threat_type", "unknown"),
+                "severity": t.get("severity", "unknown"),
+                "danger_score": t.get("danger_score", 0),
+                "source": t.get("source", "?"),
+                "description": t.get("specific_description", ""),
+                "bbox": t.get("bbox", {"x": 0, "y": 0, "w": 0, "h": 0}),
+            }
+            for t in all_threats
+        ],
+        "qml_waypoints": get_waypoints_for_qml(),
+        "scene_summary": scene_summary,
+        "all_candidates": all_candidates,
+        "pipeline_time_s": total_time,
+    }
+
+    print(f"\n{'='*62}")
+    print(f"COMPLETE — {total_time}s | threats={len(all_threats)} | rejected={len(rejected)} | cmd={rover_command}")
+    print(f"{'='*62}")
+    return output
+
+# ------------------------------------------------------------
+# Enhanced session stats
+# ------------------------------------------------------------
+def print_session_stats():
+    confirmed = [t for t in threat_log if t.get("threat_confirmed")]
+    survivors = [t for t in threat_log if "survivor" in t.get("subject_type", "")]
+    groq_calls = sum(1 for e in pipeline_trace if e["stage"] == "GROQ" and "Calling" in e.get("message", ""))
+    skipped_calls = sum(1 for e in pipeline_trace if e["stage"] == "GROQ" and "skip" in e.get("message", "").lower())
+
+    print(f"\n{'='*62}\nSESSION STATS\n{'='*62}")
+    print(f"  Frames processed    : {frame_count}")
+    print(f"  Total candidates    : {len(candidate_log)}")
+    print(f"  Threats emitted     : {len(threat_log)}")
+    print(f"  Confirmed threats   : {len(confirmed)}")
+    print(f"  Survivors found     : {len(survivors)}")
+    print(f"  Groq calls fired    : {groq_calls}")
+    print(f"  Groq calls skipped  : {skipped_calls}  [R1 savings]")
+    if groq_calls + skipped_calls > 0:
+        skip_pct = round(skipped_calls / (groq_calls + skipped_calls) * 100)
+        print(f"  Scene-gate savings  : {skip_pct}% of potential Groq calls avoided")
+    print(f"  Rejections by Groq  : {len(rejection_log)}")
+    print(f"  Promoted frames     : {selected_frame_count}")
+    if promoted_frame_log:
+        print(f"  Last promoted frame : {promoted_frame_log[-1]['frame_id']}")
+
+    if candidate_log:
+        src_counts = defaultdict(int)
+        for c in candidate_log:
+            src_counts[c["candidate_source"]] += 1
+        print(f"\n  Candidates by source:")
+        for src, cnt in sorted(src_counts.items(), key=lambda x: -x[1]):
+            rej = sum(1 for r in rejection_log if r["candidate_source"] == src)
+            print(f"    {src:25}: {cnt} total, {rej} rejected "
+                  f"({round(rej/cnt*100) if cnt else 0}% rejection rate)")
+
+print("✅ PATCH 2 loaded.")
+print("   Fixes:")
+print("   - current-event frame promotion")
+print("   - scene-level danger fallback")
+print("   - synthetic fire-scene candidate")
 
 # ── To run DroidCam stream: ───────────────────────────────────
 # run_droidcam_stream()
@@ -1758,13 +2704,16 @@ def run_droidcam_stream(waypoint_id=None):
 # To signal a waypoint transition mid-stream from another cell:
 # on_waypoint_transition("checkpoint_3")
 # ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    args = parse_args()
+    run_loop(args)
 
-print("\n── GUI ───────────────────────────────────────────────")
-for t in get_latest_threats():
-    print(f"  [{t['source']}] {t.get('specific_description','')[:70]}")
+    print("\n── GUI ───────────────────────────────────────────────")
+    for t in get_latest_threats():
+        print(f"  [{t['source']}] {t.get('specific_description','')[:70]}")
 
-print("\n── QML waypoints ─────────────────────────────────────")
-for wp in get_waypoints_for_qml():
-    print(f"  {wp['id']} | {wp.get('specific_description','')[:60]}")
+    print("\n── QML waypoints ─────────────────────────────────────")
+    for wp in get_waypoints_for_qml():
+        print(f"  {wp['id']} | {wp.get('specific_description','')[:60]}")
 
-print(f"\n── Arduino: {get_rover_command()}")
+    print(f"\n── Arduino: {get_rover_command()}")
