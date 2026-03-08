@@ -34,13 +34,16 @@ print("✅ All imports successful.")
 
 # ── CELL 3: Configuration ────────────────────────────────────
 import os
+from dotenv import load_dotenv
+load_dotenv()  # loads GROQ_API_KEY from a .env file if present (never committed)
+
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 # Model options (groq SDK + console.groq.com API key):
 #   "meta-llama/llama-4-scout-17b-16e-instruct" — latest multimodal ✓  ← recommended
 #   "llama-3.2-90b-vision-preview"  — smarter, multimodal ✓
 #   "llama-3.2-11b-vision-preview"  — fast, multimodal ✓
 # NOTE: All Groq vision models are multimodal (image + text input supported).
-# Set your key: export GROQ_API_KEY="gsk_..."
+# To set your key: copy .env.example → .env and fill in GROQ_API_KEY=gsk_...
 GROQ_MODEL       = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # All Groq vision models support image input.

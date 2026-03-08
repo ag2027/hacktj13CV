@@ -2,3 +2,4 @@ pyserial
 flask
 pennylane
 groq
+python-dotenv
