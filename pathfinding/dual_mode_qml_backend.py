@@ -5,6 +5,7 @@ import math
 import random
 from functools import lru_cache
 from collections import deque
+import heapq
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -111,6 +112,7 @@ class LocalExplorer:
         self._safe_ids: set[str] = set()
         self._blocked_ids: set[str] = set()
         self.known_point_meta: dict[Point, dict[str, Any]] = {}
+        self.qml_score_cache: dict[tuple[int, int], float] = {}
         self.last_move = (0, -1)
         self.sweep_direction = -1
 
@@ -158,25 +160,60 @@ class LocalExplorer:
             self.safe_reports.append(point)
             self.timeline.append(f"sensor safe {point['id']} @ ({point['x']},{point['y']})")
 
-    def _shortest_known_path(self, start: Point, goal: Point) -> list[Point]:
-        queue = deque([start])
-        parent = {start: None}
-        while queue:
-            cur = queue.popleft()
-            if cur == goal:
+    def _goal_distance(self, cell: Point) -> int:
+        if self.goal is None:
+            return 0
+        return abs(cell[0] - self.goal[0]) + abs(cell[1] - self.goal[1])
+
+    def _qml_score(self, cell: Point) -> float:
+        progress = round(self._progress_hint(cell), 3)
+        safety = round(self._safety_hint(cell), 3)
+        key = (int(progress * 1000), int(safety * 1000))
+        if key not in self.qml_score_cache:
+            self.qml_score_cache[key] = self.qml.score(progress, safety)
+        return self.qml_score_cache[key]
+
+    def _transition_cost(self, current: Point, nxt: Point) -> float:
+        cost = 1.0
+        if nxt in self.covered:
+            cost += 0.35
+        point = self.known_point_meta.get(nxt)
+        if point is not None:
+            cost += 0.45 * float(point.get("risk", 0.0))
+        cost -= 0.28 * self._qml_score(nxt)
+        return max(0.2, cost)
+
+    def _astar_path(self, start: Point, goal: Point, *, prefer_uncovered: bool) -> list[Point]:
+        open_heap: list[tuple[float, float, Point]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start))
+        came_from: dict[Point, Point | None] = {start: None}
+        g_score: dict[Point, float] = {start: 0.0}
+
+        while open_heap:
+            _, _, current = heapq.heappop(open_heap)
+            if current == goal:
                 break
-            for nxt in self.neighbors(cur):
-                if nxt in parent or nxt not in self.known_safe:
+            for nxt in self.neighbors(current):
+                if nxt not in self.known_safe:
                     continue
-                parent[nxt] = cur
-                queue.append(nxt)
-        if goal not in parent:
+                tentative = g_score[current] + self._transition_cost(current, nxt)
+                if prefer_uncovered and nxt not in self.covered:
+                    tentative -= 0.15
+                if tentative >= g_score.get(nxt, float('inf')):
+                    continue
+                came_from[nxt] = current
+                g_score[nxt] = tentative
+                heuristic = abs(nxt[0] - goal[0]) + abs(nxt[1] - goal[1])
+                heuristic *= 1.0 - 0.20 * self._qml_score(nxt)
+                heapq.heappush(open_heap, (tentative + heuristic, heuristic, nxt))
+
+        if goal not in came_from:
             return []
         out: list[Point] = []
         cur: Point | None = goal
         while cur is not None:
             out.append(cur)
-            cur = parent[cur]
+            cur = came_from[cur]
         return list(reversed(out))
 
     def _progress_hint(self, cell: Point) -> float:
@@ -199,13 +236,32 @@ class LocalExplorer:
         if not candidates:
             return None
 
+        current_goal_dist = self._goal_distance(current) if self.goal is not None else None
+        if current_goal_dist is not None:
+            improving = [n for n in candidates if self._goal_distance(n) < current_goal_dist]
+            if improving:
+                candidates = improving
+
         def score(cell: Point) -> float:
             dx = cell[0] - current[0]
             dy = cell[1] - current[1]
+            qml_score = self._qml_score(cell)
+
+            if self.goal is not None:
+                goal_delta = current_goal_dist - self._goal_distance(cell)
+                x_dir = 0 if self.goal[0] == current[0] else (1 if self.goal[0] > current[0] else -1)
+                y_dir = 0 if self.goal[1] == current[1] else (1 if self.goal[1] > current[1] else -1)
+                alignment = 0.0
+                if dx == x_dir and x_dir != 0:
+                    alignment += 0.75
+                if dy == y_dir and y_dir != 0:
+                    alignment += 0.75
+                straight = 0.30 if (dx, dy) == self.last_move else 0.0
+                return qml_score + 2.40 * goal_delta + alignment + straight
+
             straight = 1.30 if (dx, dy) == self.last_move else 0.0
             column_sweep = 1.10 if dx == 0 and dy == self.sweep_direction else 0.0
             next_column = 0.82 if dx == 1 and dy == 0 else 0.0
-            qml_score = self.qml.score(self._progress_hint(cell), self._safety_hint(cell))
             return qml_score + straight + column_sweep + next_column
 
         candidates.sort(key=score, reverse=True)
@@ -237,16 +293,24 @@ class LocalExplorer:
                 self.timeline.append(f"goal reached @ ({current[0]},{current[1]})")
                 break
 
-            nxt = self._choose_local_move(current)
+            if mode_goal and self.goal in self.known_safe:
+                goal_path = self._astar_path(current, self.goal, prefer_uncovered=False)
+                if len(goal_path) >= 2:
+                    nxt = goal_path[1]
+                    self.debug.append(f"astar goal ({current[0]},{current[1]}) -> ({self.goal[0]},{self.goal[1]})")
+                else:
+                    nxt = self._choose_local_move(current)
+            else:
+                nxt = self._choose_local_move(current)
             if nxt is None:
                 frontier = self._nearest_frontier(current)
                 if frontier is None:
                     break
-                path = self._shortest_known_path(current, frontier)
+                path = self._astar_path(current, frontier, prefer_uncovered=True)
                 if len(path) < 2:
                     break
                 nxt = path[1]
-                self.debug.append(f"frontier fallback ({current[0]},{current[1]}) -> ({frontier[0]},{frontier[1]})")
+                self.debug.append(f"astar frontier ({current[0]},{current[1]}) -> ({frontier[0]},{frontier[1]})")
 
             self.path.append(nxt)
             self.timeline.append(f"move ({current[0]},{current[1]}) -> ({nxt[0]},{nxt[1]})")
@@ -307,6 +371,7 @@ class LocalExplorer:
                 "blocked_count": len(self.blocked_reports),
                 "safe_count": len(self.safe_reports),
                 "goal_reached": goal_reached,
+                "qml_cache_size": len(self.qml_score_cache),
             },
         }
 

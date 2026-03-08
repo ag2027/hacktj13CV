@@ -33,12 +33,12 @@
     .toolbar button.action:disabled, .tab:disabled { opacity:.6; cursor:not-allowed; }
     .toolbar label { color:var(--muted); font-size:.92rem; }
     .left { display:grid; grid-template-rows:auto auto 1fr; }
-    .canvas-wrap { position:relative; padding:18px; min-height:700px; }
+    .canvas-wrap { padding:18px 18px 10px; min-height:700px; }
     canvas { width:100%; min-height:650px; display:block; border-radius:14px; background:#fdfaf4; border:1px solid rgba(0,0,0,.08); }
-    .overlay { position:absolute; left:34px; right:34px; bottom:34px; display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-    .mini { background:rgba(255,250,240,.93); border:1px solid rgba(0,0,0,.08); border-radius:14px; padding:10px 12px; }
-    .mini h3 { margin:0 0 8px; font-size:.95rem; }
-    .mini pre { margin:0; font-family:Consolas, monospace; white-space:pre-wrap; color:var(--muted); }
+    .overlay { padding:0 18px 18px; display:grid; grid-template-columns:repeat(3,minmax(180px, 1fr)); gap:10px; }
+    .mini { background:rgba(255,250,240,.76); backdrop-filter: blur(4px); border:1px solid rgba(0,0,0,.06); border-radius:12px; padding:8px 10px; box-shadow: 0 6px 18px rgba(31,41,51,.08); }
+    .mini h3 { margin:0 0 4px; font-size:.82rem; letter-spacing:.02em; color:var(--ink); }
+    .mini pre { margin:0; font-family:Consolas, monospace; white-space:pre-wrap; color:var(--muted); font-size:.76rem; line-height:1.25; max-height:92px; overflow:hidden; }
     .right { display:grid; grid-template-rows:auto auto auto 1fr auto; gap:12px; padding:16px; }
     .card { background:rgba(255,255,255,.62); border:1px solid rgba(0,0,0,.08); border-radius:14px; padding:14px; }
     .card h2 { margin:0 0 10px; font-size:1.05rem; }
@@ -47,7 +47,7 @@
     .metric .label { display:block; font-size:.78rem; text-transform:uppercase; color:var(--muted); margin-bottom:4px; }
     .metric .value { font-weight:700; }
     .mono { font-family:Consolas, monospace; font-size:.88rem; background:rgba(31,41,51,.04); border-radius:10px; padding:10px; max-height:220px; overflow:auto; white-space:pre-wrap; }
-    @media (max-width: 1180px) { .app { grid-template-columns:1fr; } .overlay { position:static; grid-template-columns:1fr; padding-top:12px; } }
+    @media (max-width: 1180px) { .app { grid-template-columns:1fr; } .overlay { grid-template-columns:1fr; padding:12px 18px 18px; } .mini pre { max-height:none; } }
   </style>
 </head>
 <body>
@@ -72,11 +72,11 @@
       </div>
       <div class="canvas-wrap">
         <canvas id="mapCanvas" width="980" height="680"></canvas>
-        <div class="overlay">
-          <div class="mini"><h3>QML</h3><pre id="qmlBox">-</pre></div>
-          <div class="mini"><h3>Robot State</h3><pre id="poseBox">-</pre></div>
-          <div class="mini"><h3>Coordinates</h3><pre id="coordBox">-</pre></div>
-        </div>
+      </div>
+      <div class="overlay">
+        <div class="mini"><h3>QML</h3><pre id="qmlBox">-</pre></div>
+        <div class="mini"><h3>Robot State</h3><pre id="poseBox">-</pre></div>
+        <div class="mini"><h3>Coordinates</h3><pre id="coordBox">-</pre></div>
       </div>
     </section>
     <aside class="panel right">
@@ -181,7 +181,7 @@
       const token = state.animToken;
       if (state.timer) clearInterval(state.timer);
       els.meta.textContent = `${data.title} | case=${data.case_index + 1} | mode=${data.mode} | real QML backend via PennyLane`;
-      els.qmlBox.textContent = `${data.qml.framework}\n${data.qml.device}\n${data.qml.circuit}\nqubits=${data.qml.qubits} layers=${data.qml.layers}\n${data.qml.note}`;
+      els.qmlBox.textContent = `${data.qml.framework} | ${data.qml.device}\n${data.qml.circuit}\nq=${data.qml.qubits} l=${data.qml.layers}`;
       els.scenarioBox.innerHTML = `<div><strong>${data.title}</strong></div><div>start=(${data.start.x}, ${data.start.y})${data.goal ? ` | goal=(${data.goal.x}, ${data.goal.y})` : ''}</div><div>grid=${data.width}x${data.height}</div><div>robot knowledge=${data.goal ? 'goal-only plus live local sensing' : 'live local sensing only'}</div>`;
       els.statsBox.innerHTML = [
         ['Steps', data.stats.steps], ['Coverage', `${(data.stats.coverage_rate*100).toFixed(1)}%`], ['Goal', data.goal ? (data.stats.goal_reached ? 'Reached' : 'Not yet') : 'N/A'],
@@ -207,9 +207,8 @@
         els.coordBox.textContent = [
           `current=(${pose.x}, ${pose.y})`,
           ...(state.data.goal ? [`goal=(${state.data.goal.x}, ${state.data.goal.y})`] : []),
-          ...hazardsSeen.map(h => `(${h.x}, ${h.y}) - hazardous obstruction`),
-          ...blockedSeen.map(b => `(${b.x}, ${b.y}) - blocked obstruction`),
-          ...safeSeen.map(s => `(${s.x}, ${s.y}) - nonhazardous obstruction`)
+          `hazards=${hazardsSeen.length} blocked=${blockedSeen.length}`,
+          `safe=${safeSeen.length} detected=${visible.length}`
         ].join('\n');
         els.hazBox.textContent = hazardsSeen.length
           ? hazardsSeen.map(h => `(${h.x}, ${h.y}) - hazardous obstruction`).join('\n')
